@@ -205,8 +205,10 @@ class VideoPhotoSlideTests(unittest.TestCase):
         )
 
         self.assertIn("crop=1920:1080", filt)
-        self.assertIn("min(max((0.25*iw)-(ow/2),0),max(iw-ow,0))", filt)
-        self.assertIn("min(max((0.4*ih)-(oh/2),0),max(ih-oh,0))", filt)
+        self.assertIn("force_original_aspect_ratio=increase", filt)
+        self.assertIn("3*pow(min(max((t/2.8),0),1),2)-2*pow(min(max((t/2.8),0),1),3)", filt)
+        self.assertIn("*iw)-(ow/2)", filt)
+        self.assertIn("*ih)-(oh/2)", filt)
 
     def test_build_filter_for_still_without_focus_keeps_overlay_path(self):
         filt = vps.build_filter_for_still(
@@ -219,8 +221,22 @@ class VideoPhotoSlideTests(unittest.TestCase):
             focal_point=None,
         )
 
+        self.assertIn("force_original_aspect_ratio=increase", filt)
+        self.assertIn("crop=1920:1080", filt)
+        self.assertNotIn("[bg0][fg0]overlay=(W-w)/2:(H-h)/2", filt)
+
+    def test_build_filter_for_still_without_kenburns_keeps_overlay_path(self):
+        filt = vps.build_filter_for_still(
+            0,
+            1920,
+            1080,
+            30,
+            2.8,
+            ken_strength=0.0,
+            focal_point=None,
+        )
+
         self.assertIn("force_original_aspect_ratio=decrease", filt)
-        self.assertNotIn("[crop0]", filt)
         self.assertIn("[bg0][fg0]overlay=(W-w)/2:(H-h)/2", filt)
 
     def test_run_ffmpeg_with_progress_includes_tail_on_failure(self):

@@ -472,46 +472,61 @@ def build_filter_for_still(
     focal_point: Optional[Tuple[float, float]] = None,
 ):
     local_rng = random.Random(motion_seed + i * 101)
-    drift_dir = -1 if local_rng.random() < 0.5 else 1
 
     u = f"(t/{sec})"
-    # Linear easing: simplest, fewest rounding artifacts
-    ease = u
+    smooth_u = f"min(max({u},0),1)"
+    ease = f"(3*pow({smooth_u},2)-2*pow({smooth_u},3))"
     bg = (
         f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
         f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
         f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
     )
-    fg_scale_mode = "increase" if focal_point else "decrease"
-    fg_base = f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio={fg_scale_mode},setsar=1,"
     if ken_strength > 0:
-        # Smoothstep easing avoids abrupt starts/stops and feels less robotic.
-        fg_base += (
-            f"scale=w='iw*(1+{ken_strength}*{ease})':"
-            f"h='ih*(1+{ken_strength}*{ease})':eval=frame,"
+        focus_x = focal_point[0] if focal_point else 0.5
+        focus_y = focal_point[1] if focal_point else 0.5
+
+        base_zoom = 1.0 + ken_strength
+        end_zoom = 1.0 + (ken_strength * 2.4)
+        drift_norm_x = local_rng.uniform(-0.12, 0.12)
+        drift_norm_y = local_rng.uniform(-0.08, 0.08)
+        if parallax_px > 0:
+            drift_norm_x += local_rng.choice([-1, 1]) * (parallax_px / max(width, 1))
+            drift_norm_y += local_rng.choice([-1, 1]) * (parallax_px / max(height, 1))
+        start_fx = clamp(focus_x - (drift_norm_x * 0.5), 0.18, 0.82)
+        end_fx = clamp(focus_x + (drift_norm_x * 0.5), 0.18, 0.82)
+        start_fy = clamp(focus_y - (drift_norm_y * 0.5), 0.18, 0.82)
+        end_fy = clamp(focus_y + (drift_norm_y * 0.5), 0.18, 0.82)
+
+        fg = (
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,setsar=1,"
+            f"scale=w='iw*({base_zoom}+(({end_zoom}-{base_zoom})*{ease}))':"
+            f"h='ih*({base_zoom}+(({end_zoom}-{base_zoom})*{ease}))':eval=frame,"
+            f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
         )
-    fg = fg_base + f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
+        start_x = f"min(max(({start_fx}*iw)-(ow/2),0),max(iw-ow,0))"
+        end_x = f"min(max(({end_fx}*iw)-(ow/2),0),max(iw-ow,0))"
+        start_y = f"min(max(({start_fy}*ih)-(oh/2),0),max(ih-oh,0))"
+        end_y = f"min(max(({end_fy}*ih)-(oh/2),0),max(ih-oh,0))"
+        crop_x = f"({start_x})+(({end_x})-({start_x}))*{ease}"
+        crop_y = f"({start_y})+(({end_y})-({start_y}))*{ease}"
+        comp = (
+            f"[fg{i}]crop={width}:{height}:x='{crop_x}':y='{crop_y}',"
+            "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
+            "vignette=PI/10,"
+            "noise=alls=3:allf=t+u,"
+            f"format=yuv420p[v{i}]"
+        )
+        return ";\n".join([fg, comp])
 
-    if focal_point:
-        focus_x = clamp(focal_point[0], 0.0, 1.0)
-        focus_y = clamp(focal_point[1], 0.0, 1.0)
-        base_x = f"min(max(({focus_x}*iw)-(ow/2),0),max(iw-ow,0))"
-        base_y = f"min(max(({focus_y}*ih)-(oh/2),0),max(ih-oh,0))"
-        fg_input = f"[crop{i}]"
-        crop_step = f"[fg{i}]crop={width}:{height}:x='{base_x}':y='{base_y}'[crop{i}];\n"
-    else:
-        fg_input = f"[fg{i}]"
-        crop_step = ""
-
+    fg = f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
     if parallax_px > 0:
-        parallax_drift = f"{drift_dir * parallax_px}*({ease}-0.5)"
+        parallax_drift = f"{local_rng.choice([-1, 1]) * parallax_px}*({ease}-0.5)"
         overlay = f"overlay=x='(W-w)/2+({parallax_drift})':y='(H-h)/2'"
     else:
         overlay = "overlay=(W-w)/2:(H-h)/2"
 
     comp = (
-        f"{crop_step}"
-        f"[bg{i}]{fg_input}{overlay},"
+        f"[bg{i}][fg{i}]{overlay},"
         "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
         "vignette=PI/10,"
         "noise=alls=3:allf=t+u,"
