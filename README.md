@@ -63,6 +63,12 @@ Optional YouTube upload dependencies:
 pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
 ```
 
+Optional smart-focus dependency for subject-aware Ken Burns framing:
+
+```bash
+pip install mediapipe
+```
+
 ---
 
 ## Usage
@@ -92,6 +98,7 @@ python videophotoslide.py ./input_photos
 | --motion-style | none | none, kenburns, parallax, both |
 | --ken-burns-strength | auto | Override Ken Burns strength (0.0 to 0.03) |
 | --parallax-px | auto | Override parallax amplitude in pixels |
+| --smart-focus | off | Use MediaPipe face detection with pose fallback to bias Ken Burns framing |
 | --sort-by | natural | natural, time, location, random |
 | --seed | 0 | Seed for sort and pacing variation |
 | --youtube-upload | off | Upload each rendered output to YouTube after rendering |
@@ -119,6 +126,9 @@ python videophotoslide.py ./input_photos --transition auto --rhythm-strength 0.1
 
 # Vertical-only output
 python videophotoslide.py ./input_photos --format 9x16
+
+# Ken Burns with subject-aware framing
+python videophotoslide.py ./input_photos --motion-style kenburns --smart-focus
 
 # Render and upload to YouTube as private
 python videophotoslide.py ./input_photos \
@@ -178,6 +188,11 @@ Then each shot receives:
 
 Transitions:
 - auto mode rotates through a restrained set for a modern professional flow.
+
+Smart focus:
+- `--smart-focus` is a clean v1 subject-targeting mode for Ken Burns.
+- It uses MediaPipe face detection first, pose fallback second, and otherwise falls back to center framing.
+- It currently activates when `--motion-style` is `kenburns` or `both`.
 
 ---
 
