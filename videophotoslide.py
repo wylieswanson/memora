@@ -1181,7 +1181,11 @@ def main():
                     args.sec, args.xfade, args.rhythm_strength, args.seed,
                     args.split_secs,
                 )
-                progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
+                if len(part_groups) <= 1:
+                    progress_print(args.progress, "[phase split] skipped: content fits in a single part")
+                    part_groups = []
+                else:
+                    progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
                 for part_idx, (part_imgs, _, part_focal) in enumerate(part_groups, start=1):
                     part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
                     progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} images -> {part_out.name}")
@@ -1203,6 +1207,22 @@ def main():
                         progress_print(args.progress, f"[phase photos] importing {part_out.name}")
                         print(f"Importing into Photos: {part_out.name}")
                         import_media_to_photos([part_out])
+
+                    if args.youtube_upload:
+                        part_title = build_youtube_title(part_out, src, f"{width}x{height}", args.youtube_title)
+                        progress_print(args.progress, f"[phase youtube] uploading {part_out.name}")
+                        print(f"Uploading to YouTube: {part_title}")
+                        part_id = upload_video_to_youtube(
+                            video_path=part_out,
+                            title=part_title,
+                            description=args.youtube_description,
+                            tags=youtube_tags,
+                            category=args.youtube_category,
+                            privacy=args.youtube_privacy,
+                            client_secrets=youtube_client_secrets,
+                            token_file=youtube_token_file,
+                        )
+                        print(f"YouTube upload complete: https://www.youtube.com/watch?v={part_id}")
     except RuntimeError as exc:
         raise SystemExit(str(exc))
     else:

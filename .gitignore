@@ -1,4 +1,5 @@
 .DS_Store
+tests/.DS_Store
 .youtube_token.json
 Photos/
 Renders/
