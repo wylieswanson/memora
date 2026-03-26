@@ -17,6 +17,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -211,6 +212,7 @@ def estimate_duration_variable(photo_durations: List[float], xfade_seconds: floa
     return sum(photo_durations) - max(0, len(photo_durations) - 1) * xfade_seconds
 
 
+@lru_cache(maxsize=None)
 def ffmpeg_has_encoder(encoder_name: str) -> bool:
     probe = subprocess.run(
         ["ffmpeg", "-hide_banner", "-encoders"],
@@ -391,12 +393,15 @@ def _convert_single_image(args_tuple):
         return idx, None, None, f"{src.name}: {e}"
 
 
+def _init_mediapipe_worker():
+    _get_mediapipe_detectors()
+
+
 def convert_to_pngs(
     input_dir: Path,
     work_dir: Path,
     extract_exif: bool = True,
     detect_focus: bool = False,
-    parallel: bool = True,
     max_workers: int = 0,
     show_progress: bool = False,
 ) -> Tuple[List[Path], List[Optional[PhotoInfo]]]:
@@ -424,10 +429,11 @@ def convert_to_pngs(
         extra = f", focus hits={focus_hits}" if detect_focus else ""
         print(f"[prep {progress_label} {processed_count}/{len(image_files)} {pct:5.1f}%{extra}]")
 
-    if parallel and len(image_files) > 3:
+    if len(image_files) > 3:
         auto_workers = min(len(image_files), max(2, min(cpu_count(), 6)))
         workers = auto_workers if max_workers <= 0 else max(1, min(len(image_files), max_workers))
-        with Pool(workers) as pool:
+        initializer = _init_mediapipe_worker if detect_focus else None
+        with Pool(workers, initializer=initializer) as pool:
             processed = 0
             focus_hits = 0
             results = []
@@ -476,22 +482,18 @@ def build_filter_for_still(
     u = f"(t/{sec})"
     smooth_u = f"min(max({u},0),1)"
     ease = f"(3*pow({smooth_u},2)-2*pow({smooth_u},3))"
-    bg = (
-        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-        f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
-        f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
-    )
     if ken_strength > 0:
         focus_x = focal_point[0] if focal_point else 0.5
         focus_y = focal_point[1] if focal_point else 0.5
 
-        base_zoom = 1.0 + ken_strength
-        end_zoom = 1.0 + (ken_strength * 2.4)
-        drift_norm_x = local_rng.uniform(-0.12, 0.12)
-        drift_norm_y = local_rng.uniform(-0.08, 0.08)
+        has_subject_target = focal_point is not None
+        base_zoom = 1.0 + (ken_strength * 0.45)
+        end_zoom = 1.0 + (ken_strength * (1.25 if has_subject_target else 0.85))
+        drift_norm_x = local_rng.uniform(-0.045, 0.045) if has_subject_target else local_rng.uniform(-0.02, 0.02)
+        drift_norm_y = local_rng.uniform(-0.03, 0.03) if has_subject_target else local_rng.uniform(-0.015, 0.015)
         if parallax_px > 0:
-            drift_norm_x += local_rng.choice([-1, 1]) * (parallax_px / max(width, 1))
-            drift_norm_y += local_rng.choice([-1, 1]) * (parallax_px / max(height, 1))
+            drift_norm_x += local_rng.choice([-1, 1]) * ((parallax_px * 0.35) / max(width, 1))
+            drift_norm_y += local_rng.choice([-1, 1]) * ((parallax_px * 0.35) / max(height, 1))
         start_fx = clamp(focus_x - (drift_norm_x * 0.5), 0.18, 0.82)
         end_fx = clamp(focus_x + (drift_norm_x * 0.5), 0.18, 0.82)
         start_fy = clamp(focus_y - (drift_norm_y * 0.5), 0.18, 0.82)
@@ -518,6 +520,11 @@ def build_filter_for_still(
         )
         return ";\n".join([fg, comp])
 
+    bg = (
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+        f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
+        f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
+    )
     fg = f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
     if parallax_px > 0:
         parallax_drift = f"{local_rng.choice([-1, 1]) * parallax_px}*({ease}-0.5)"
@@ -603,6 +610,7 @@ def build_render_command(
     motion_seed=0,
     rhythm_strength=0.12,
     focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
+    audio_path: Optional[Path] = None,
 ):
     photo_durations = build_photo_durations(len(images), sec, xfade, rhythm_strength, motion_seed)
     duration = estimate_duration_variable(photo_durations, xfade)
@@ -613,6 +621,8 @@ def build_render_command(
         cmd += ["-hwaccel", "videotoolbox"]
     for img, still_sec in zip(images, photo_durations):
         cmd += ["-loop", "1", "-t", str(still_sec), "-i", str(img)]
+    if audio_path is not None:
+        cmd += ["-i", str(audio_path)]
 
     filters = [
         build_filter_for_still(
@@ -632,6 +642,9 @@ def build_render_command(
     filter_complex = ";\n".join(filters) + ";\n" + build_xfade_chain(photo_durations, xfade, transition)
 
     cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-r", str(fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    if audio_path is not None:
+        audio_index = len(images)
+        cmd += ["-map", f"{audio_index}:a", "-c:a", "aac", "-b:a", "192k", "-shortest"]
     if encoder == "h264_videotoolbox":
         cmd += ["-c:v", "h264_videotoolbox", "-b:v", bitrate]
     else:
@@ -644,28 +657,19 @@ def build_render_command(
 
 def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, transition="auto", blur_strength=18,
            bitrate="15M", quality_name="standard", encoder="h264_videotoolbox",
-        motion_style="none", ken_override=None, parallax_override=None, motion_seed=0,
-        rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None):
-    cmd, duration = build_render_command(
-        images,
-        out_path,
-        width,
-        height,
-        fps=fps,
-        sec=sec,
-        xfade=xfade,
-        transition=transition,
-        blur_strength=blur_strength,
-        bitrate=bitrate,
-        quality_name=quality_name,
-        encoder=encoder,
-        motion_style=motion_style,
-        ken_override=ken_override,
-        parallax_override=parallax_override,
-        motion_seed=motion_seed,
-        rhythm_strength=rhythm_strength,
-        focal_points=focal_points,
+           motion_style="none", ken_override=None, parallax_override=None, motion_seed=0,
+           rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
+           audio_path: Optional[Path] = None):
+    render_kwargs = dict(
+        images=images, out_path=out_path, width=width, height=height,
+        fps=fps, sec=sec, xfade=xfade, transition=transition,
+        blur_strength=blur_strength, bitrate=bitrate, quality_name=quality_name,
+        encoder=encoder, motion_style=motion_style, ken_override=ken_override,
+        parallax_override=parallax_override, motion_seed=motion_seed,
+        rhythm_strength=rhythm_strength, focal_points=focal_points,
+        audio_path=audio_path,
     )
+    cmd, duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
     try:
         run_ffmpeg_with_progress(cmd, duration)
     except RuntimeError as exc:
@@ -677,52 +681,10 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
         if not videotoolbox_failed:
             raise
         print("VideoToolbox encoder failed; retrying with libx264")
-        fallback_cmd, fallback_duration = build_render_command(
-            images,
-            out_path,
-            width,
-            height,
-            fps=fps,
-            sec=sec,
-            xfade=xfade,
-            transition=transition,
-            blur_strength=blur_strength,
-            bitrate=bitrate,
-            quality_name=quality_name,
-            encoder="libx264",
-            motion_style=motion_style,
-            ken_override=ken_override,
-            parallax_override=parallax_override,
-            motion_seed=motion_seed,
-            rhythm_strength=rhythm_strength,
-            focal_points=focal_points,
-        )
+        render_kwargs["encoder"] = "libx264"
+        fallback_cmd, fallback_duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
         run_ffmpeg_with_progress(fallback_cmd, fallback_duration)
 
-
-def sort_photos(images: List[Path], infos: List[Optional[PhotoInfo]], sort_by="natural", seed=0) -> List[Path]:
-    if sort_by == "natural":
-        return images
-    if sort_by == "random":
-        rnd = random.Random(seed)
-        out = images.copy()
-        rnd.shuffle(out)
-        return out
-    if sort_by == "time":
-        with_dt = [(i, m) for i, m in zip(images, infos) if m and m.datetime_taken]
-        no_dt = [(i, m) for i, m in zip(images, infos) if not m or not m.datetime_taken]
-        if not with_dt:
-            return images
-        with_dt.sort(key=lambda x: x[1].datetime_taken or datetime.min)
-        return [i for i, _ in with_dt] + [i for i, _ in no_dt]
-    if sort_by == "location":
-        with_gps = [(i, m) for i, m in zip(images, infos) if m and m.gps_coords]
-        no_gps = [(i, m) for i, m in zip(images, infos) if not m or not m.gps_coords]
-        if not with_gps:
-            return images
-        with_gps.sort(key=lambda x: x[1].gps_coords or (float("inf"), float("inf")))
-        return [i for i, _ in with_gps] + [i for i, _ in no_gps]
-    raise ValueError(f"Unknown sort mode: {sort_by}")
 
 
 def sort_images_and_infos(
@@ -782,6 +744,8 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rhythm-strength", type=float, default=0.12,
                     help="Per-photo timing variation strength (0.0 to 0.25)")
+    ap.add_argument("--audio", default=None,
+                    help="Path to an audio file to mix into the slideshow. Trimmed to video length.")
     ap.add_argument("--youtube-upload", action="store_true",
                     help="Upload rendered videos to YouTube after rendering completes")
     ap.add_argument("--youtube-upload-file", default=None,
@@ -964,6 +928,7 @@ def upload_video_to_youtube(
 ) -> str:
     try:
         from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
         from googleapiclient.http import MediaFileUpload
     except ImportError as exc:
         raise SystemExit(
@@ -990,8 +955,16 @@ def upload_video_to_youtube(
     )
 
     response = None
+    retries = 0
     while response is None:
-        _status, response = request.next_chunk()
+        try:
+            _, response = request.next_chunk()
+        except HttpError as exc:
+            if exc.resp.status not in (500, 502, 503, 504) or retries >= 5:
+                raise
+            retries += 1
+            print(f"Upload chunk failed (HTTP {exc.resp.status}), retrying ({retries}/5)...")
+            time.sleep(2 ** retries)
 
     return response["id"]
 
@@ -1016,6 +989,9 @@ def main():
         raise SystemExit("--rhythm-strength must be between 0.0 and 0.25")
     if should_upload and not args.youtube_category.isdigit():
         raise SystemExit("--youtube-category must be a numeric YouTube category ID")
+    audio_path = Path(args.audio) if args.audio else None
+    if audio_path is not None and not audio_path.is_file():
+        raise SystemExit(f"--audio file not found: {audio_path}")
     outdir = Path(args.outdir)
     ensure_dir(outdir)
 
@@ -1137,6 +1113,7 @@ def main():
                 motion_seed=args.seed,
                 rhythm_strength=args.rhythm_strength,
                 focal_points=focal_points,
+                audio_path=audio_path,
             )
             outputs.append(out)
             progress_print(args.progress, f"[phase render] completed {out.name}")
