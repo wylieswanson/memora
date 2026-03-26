@@ -721,6 +721,38 @@ def sort_images_and_infos(
     raise ValueError(f"Unknown sort mode: {sort_by}")
 
 
+def split_photos_into_parts(
+    images: List[Path],
+    infos: List[Optional[PhotoInfo]],
+    focal_points: List[Optional[Tuple[float, float]]],
+    base_sec: float,
+    xfade: float,
+    rhythm_strength: float,
+    seed: int,
+    max_sec: float,
+) -> List[Tuple[List[Path], List[Optional[PhotoInfo]], List[Optional[Tuple[float, float]]]]]:
+    """Greedily group photos into parts whose estimated duration does not exceed max_sec."""
+    parts = []
+    cur_imgs: List[Path] = []
+    cur_infos: List[Optional[PhotoInfo]] = []
+    cur_focal: List[Optional[Tuple[float, float]]] = []
+
+    for img, info, fp in zip(images, infos, focal_points):
+        trial = cur_imgs + [img]
+        trial_dur = build_photo_durations(len(trial), base_sec, xfade, rhythm_strength, seed)
+        trial_total = estimate_duration_variable(trial_dur, xfade)
+        if trial_total > max_sec and cur_imgs:
+            parts.append((cur_imgs, cur_infos, cur_focal))
+            cur_imgs, cur_infos, cur_focal = [img], [info], [fp]
+        else:
+            cur_imgs, cur_infos, cur_focal = trial, cur_infos + [info], cur_focal + [fp]
+
+    if cur_imgs:
+        parts.append((cur_imgs, cur_infos, cur_focal))
+
+    return parts
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Create slideshow videos from photos.")
     ap.add_argument("source_dir", nargs="?")
@@ -746,6 +778,8 @@ def parse_args():
                     help="Per-photo timing variation strength (0.0 to 0.25)")
     ap.add_argument("--audio", default=None,
                     help="Path to an audio file to mix into the slideshow. Trimmed to video length.")
+    ap.add_argument("--split-secs", type=float, default=None,
+                    help="Also render split parts, each no longer than this many seconds")
     ap.add_argument("--youtube-upload", action="store_true",
                     help="Upload rendered videos to YouTube after rendering completes")
     ap.add_argument("--youtube-upload-file", default=None,
@@ -989,6 +1023,8 @@ def main():
         raise SystemExit("--rhythm-strength must be between 0.0 and 0.25")
     if should_upload and not args.youtube_category.isdigit():
         raise SystemExit("--youtube-category must be a numeric YouTube category ID")
+    if args.split_secs is not None and args.split_secs <= 0:
+        raise SystemExit("--split-secs must be > 0")
     audio_path = Path(args.audio) if args.audio else None
     if audio_path is not None and not audio_path.is_file():
         raise SystemExit(f"--audio file not found: {audio_path}")
@@ -1138,6 +1174,35 @@ def main():
                     token_file=youtube_token_file,
                 )
                 print(f"YouTube upload complete: https://www.youtube.com/watch?v={video_id}")
+
+            if args.split_secs is not None:
+                part_groups = split_photos_into_parts(
+                    images, infos, focal_points,
+                    args.sec, args.xfade, args.rhythm_strength, args.seed,
+                    args.split_secs,
+                )
+                progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
+                for part_idx, (part_imgs, _, part_focal) in enumerate(part_groups, start=1):
+                    part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
+                    progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} images -> {part_out.name}")
+                    render(
+                        part_imgs, part_out, width, height,
+                        fps=fps, sec=args.sec, xfade=args.xfade,
+                        transition=args.transition, blur_strength=blur,
+                        bitrate=bitrate, quality_name=args.quality,
+                        encoder=encoder, motion_style=args.motion_style,
+                        ken_override=args.ken_burns_strength,
+                        parallax_override=args.parallax_px,
+                        motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
+                        focal_points=part_focal, audio_path=audio_path,
+                    )
+                    outputs.append(part_out)
+                    progress_print(args.progress, f"[phase split] completed {part_out.name}")
+
+                    if args.add_to_photos:
+                        progress_print(args.progress, f"[phase photos] importing {part_out.name}")
+                        print(f"Importing into Photos: {part_out.name}")
+                        import_media_to_photos([part_out])
     except RuntimeError as exc:
         raise SystemExit(str(exc))
     else:
