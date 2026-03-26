@@ -641,7 +641,7 @@ def build_render_command(
     cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-r", str(fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
     if audio_path is not None:
         audio_index = len(images)
-        cmd += ["-map", f"{audio_index}:a", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        cmd += ["-map", f"{audio_index}:a", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
     if encoder == "h264_videotoolbox":
         cmd += ["-c:v", "h264_videotoolbox", "-b:v", bitrate]
     else:
@@ -1022,6 +1022,8 @@ def main():
         raise SystemExit("--youtube-category must be a numeric YouTube category ID")
     if args.split_secs is not None and args.split_secs <= 0:
         raise SystemExit("--split-secs must be > 0")
+    if args.split_secs is not None and args.split_secs < args.sec:
+        print(f"Warning: --split-secs ({args.split_secs}s) is less than --sec ({args.sec}s); every photo will be its own part", file=sys.stderr)
     audio_path = Path(args.audio) if args.audio else None
     if audio_path is not None and not audio_path.is_file():
         raise SystemExit(f"--audio file not found: {audio_path}")
