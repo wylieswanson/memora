@@ -5,7 +5,6 @@ A safer, cleaner slideshow generator derived from make_slideshow2.py.
 """
 
 import argparse
-import json
 import math
 import random
 import re
@@ -41,10 +40,9 @@ MOTION_PRESETS = {
 }
 
 # Curated transition set for modern, restrained motion language.
-PRO_TRANSITIONS = ["fade", "fadeblack", "smoothleft", "smoothright"]
+PRO_TRANSITIONS = ["fade", "smoothleft", "smoothright"]
 VALID_TRANSITIONS = {
     "auto",
-    "custom",
     "fade",
     "fadeblack",
     "fadewhite",
@@ -200,10 +198,6 @@ def detect_subject_focus(image: Image.Image) -> Optional[Tuple[float, float]]:
             return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
 
     return None
-
-
-def estimate_duration(num_photos: int, seconds_per_photo: float, xfade_seconds: float) -> float:
-    return (num_photos - 1) * (seconds_per_photo - xfade_seconds) + seconds_per_photo
 
 
 def estimate_duration_variable(photo_durations: List[float], xfade_seconds: float) -> float:
@@ -611,6 +605,7 @@ def build_render_command(
     rhythm_strength=0.12,
     focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
     audio_path: Optional[Path] = None,
+    audio_offset: float = 0.0,
 ):
     photo_durations = build_photo_durations(len(images), sec, xfade, rhythm_strength, motion_seed)
     duration = estimate_duration_variable(photo_durations, xfade)
@@ -622,6 +617,8 @@ def build_render_command(
     for img, still_sec in zip(images, photo_durations):
         cmd += ["-loop", "1", "-t", str(still_sec), "-i", str(img)]
     if audio_path is not None:
+        if audio_offset > 0:
+            cmd += ["-ss", str(audio_offset)]
         cmd += ["-i", str(audio_path)]
 
     filters = [
@@ -659,7 +656,8 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
            bitrate="15M", quality_name="standard", encoder="h264_videotoolbox",
            motion_style="none", ken_override=None, parallax_override=None, motion_seed=0,
            rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
-           audio_path: Optional[Path] = None):
+           audio_path: Optional[Path] = None,
+           audio_offset: float = 0.0):
     render_kwargs = dict(
         images=images, out_path=out_path, width=width, height=height,
         fps=fps, sec=sec, xfade=xfade, transition=transition,
@@ -667,7 +665,7 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
         encoder=encoder, motion_style=motion_style, ken_override=ken_override,
         parallax_override=parallax_override, motion_seed=motion_seed,
         rhythm_strength=rhythm_strength, focal_points=focal_points,
-        audio_path=audio_path,
+        audio_path=audio_path, audio_offset=audio_offset,
     )
     cmd, duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
     try:
@@ -684,7 +682,6 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
         render_kwargs["encoder"] = "libx264"
         fallback_cmd, fallback_duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
         run_ffmpeg_with_progress(fallback_cmd, fallback_duration)
-
 
 
 def sort_images_and_infos(
@@ -1126,6 +1123,27 @@ def main():
             len(images),
         )
 
+        if args.split_secs is not None:
+            part_groups = split_photos_into_parts(
+                images, infos, focal_points,
+                args.sec, args.xfade, args.rhythm_strength, args.seed,
+                args.split_secs,
+            )
+            if len(part_groups) <= 1:
+                progress_print(args.progress, "[phase split] skipped: content fits in a single part")
+                part_groups = []
+        else:
+            part_groups = []
+
+        part_audio_offsets: List[float] = []
+        cumulative = 0.0
+        for part_imgs, _, _ in part_groups:
+            part_audio_offsets.append(cumulative)
+            cumulative += estimate_duration_variable(
+                build_photo_durations(len(part_imgs), args.sec, args.xfade, args.rhythm_strength, args.seed),
+                args.xfade,
+            )
+
         outputs = []
         for name, width, height in targets:
             out = outdir / name
@@ -1175,17 +1193,8 @@ def main():
                 )
                 print(f"YouTube upload complete: https://www.youtube.com/watch?v={video_id}")
 
-            if args.split_secs is not None:
-                part_groups = split_photos_into_parts(
-                    images, infos, focal_points,
-                    args.sec, args.xfade, args.rhythm_strength, args.seed,
-                    args.split_secs,
-                )
-                if len(part_groups) <= 1:
-                    progress_print(args.progress, "[phase split] skipped: content fits in a single part")
-                    part_groups = []
-                else:
-                    progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
+            if part_groups:
+                progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
                 for part_idx, (part_imgs, _, part_focal) in enumerate(part_groups, start=1):
                     part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
                     progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} images -> {part_out.name}")
@@ -1199,6 +1208,7 @@ def main():
                         parallax_override=args.parallax_px,
                         motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
                         focal_points=part_focal, audio_path=audio_path,
+                        audio_offset=part_audio_offsets[part_idx - 1],
                     )
                     outputs.append(part_out)
                     progress_print(args.progress, f"[phase split] completed {part_out.name}")
