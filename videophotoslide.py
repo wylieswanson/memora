@@ -692,7 +692,8 @@ def build_xfade_chain(
 
 def run_ffmpeg_with_progress(cmd: List[str], total_duration: float):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        raise RuntimeError("ffmpeg subprocess stdout unavailable")
     last = -1.0
     error_lines = []
     for line in proc.stdout:
@@ -817,7 +818,8 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
            rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
            label_overlay_paths: Optional[List[Optional[Path]]] = None,
            audio_path: Optional[Path] = None,
-           audio_offset: float = 0.0):
+           audio_offset: float = 0.0) -> str:
+    """Run the render and return the encoder actually used."""
     render_kwargs = dict(
         images=images, out_path=out_path, width=width, height=height,
         fps=fps, sec=sec, xfade=xfade, transition=transition,
@@ -831,6 +833,7 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
     cmd, duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
     try:
         run_ffmpeg_with_progress(cmd, duration)
+        return encoder
     except RuntimeError as exc:
         message = str(exc)
         videotoolbox_failed = (
@@ -843,6 +846,7 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
         render_kwargs["encoder"] = "libx264"
         fallback_cmd, fallback_duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
         run_ffmpeg_with_progress(fallback_cmd, fallback_duration)
+        return "libx264"
 
 
 def sort_images_and_infos(
@@ -851,9 +855,9 @@ def sort_images_and_infos(
     sort_by="natural",
     seed=0,
 ) -> Tuple[List[Path], List[Optional[PhotoInfo]]]:
-    paired = list(zip(images, infos))
     if sort_by == "natural":
         return images, infos
+    paired = list(zip(images, infos))
     if sort_by == "random":
         rnd = random.Random(seed)
         rnd.shuffle(paired)
@@ -952,6 +956,12 @@ def parse_args():
                     help="Path to an audio file to mix into the slideshow. Trimmed to video length.")
     ap.add_argument("--split-secs", type=float, default=None,
                     help="Also render split parts, each no longer than this many seconds")
+    ap.add_argument("--fps", type=int, default=None,
+                    help="Override frames per second (overrides quality preset)")
+    ap.add_argument("--bitrate", default=None,
+                    help="Override output bitrate, e.g. 20M (overrides quality preset)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Print ffmpeg command(s) and estimated duration without rendering")
     ap.add_argument("--youtube-upload", action="store_true",
                     help="Upload rendered videos to YouTube after rendering completes")
     ap.add_argument("--youtube-upload-file", default=None,
@@ -1329,12 +1339,8 @@ def build_label_overlay_paths_for_infos(
     return result
 
 
-def main():
-    t0 = time.time()
-    args = parse_args()
-    upload_only_path = Path(args.youtube_upload_file) if args.youtube_upload_file else None
-    should_upload = args.youtube_upload or upload_only_path is not None
-
+def _validate_args(args) -> None:
+    should_upload = args.youtube_upload or bool(args.youtube_upload_file)
     if args.sec <= 0:
         raise SystemExit("--sec must be > 0")
     if not (0 <= args.xfade < args.sec):
@@ -1353,32 +1359,66 @@ def main():
         raise SystemExit("--split-secs must be > 0")
     if args.split_secs is not None and args.split_secs < args.sec:
         print(f"Warning: --split-secs ({args.split_secs}s) is less than --sec ({args.sec}s); every photo will be its own part", file=sys.stderr)
-    audio_path = Path(args.audio) if args.audio else None
-    if audio_path is not None and not audio_path.is_file():
-        raise SystemExit(f"--audio file not found: {audio_path}")
-    outdir = Path(args.outdir)
-    ensure_dir(outdir)
+    if args.audio and not Path(args.audio).is_file():
+        raise SystemExit(f"--audio file not found: {args.audio}")
+    if args.fps is not None and args.fps <= 0:
+        raise SystemExit("--fps must be > 0")
 
-    preset = QUALITY_PRESETS[args.quality]
-    fps = preset["fps"]
-    youtube_client_secrets = Path(args.youtube_client_secrets)
-    youtube_token_file = Path(args.youtube_token_file)
-    youtube_tags = parse_youtube_tags(args.youtube_tags)
 
-    if upload_only_path is not None:
-        if not upload_only_path.exists() or not upload_only_path.is_file():
-            raise SystemExit(f"Missing YouTube upload file: {upload_only_path}")
+def _run_upload_only(
+    args,
+    upload_only_path: Path,
+    youtube_client_secrets: Path,
+    youtube_token_file: Path,
+    youtube_tags: List[str],
+) -> None:
+    if not upload_only_path.exists() or not upload_only_path.is_file():
+        raise SystemExit(f"Missing YouTube upload file: {upload_only_path}")
 
-        input_dir = Path(args.source_dir) if args.source_dir else upload_only_path.parent
-        if args.source_dir and (not input_dir.exists() or not input_dir.is_dir()):
-            raise SystemExit(f"Missing source directory: {input_dir}")
+    input_dir = Path(args.source_dir) if args.source_dir else upload_only_path.parent
+    if args.source_dir and (not input_dir.exists() or not input_dir.is_dir()):
+        raise SystemExit(f"Missing source directory: {input_dir}")
 
-        video_fmt = infer_render_format(upload_only_path)
-        youtube_title = build_youtube_title(upload_only_path, input_dir, video_fmt, args.youtube_title)
-        progress_print(args.progress, f"[phase upload-only] preparing upload for {upload_only_path.name}")
-        print(f"Uploading existing render to YouTube: {youtube_title}")
+    video_fmt = infer_render_format(upload_only_path)
+    youtube_title = build_youtube_title(upload_only_path, input_dir, video_fmt, args.youtube_title)
+    progress_print(args.progress, f"[phase upload-only] preparing upload for {upload_only_path.name}")
+    print(f"Uploading existing render to YouTube: {youtube_title}")
+    video_id = upload_video_to_youtube(
+        video_path=upload_only_path,
+        title=youtube_title,
+        description=args.youtube_description,
+        tags=youtube_tags,
+        category=args.youtube_category,
+        privacy=args.youtube_privacy,
+        client_secrets=youtube_client_secrets,
+        token_file=youtube_token_file,
+    )
+    print(f"YouTube upload complete: https://www.youtube.com/watch?v={video_id}")
+    if args.add_to_photos:
+        print(f"Importing into Photos: {upload_only_path.name}")
+        import_media_to_photos([upload_only_path])
+
+
+def _post_render_output(
+    out: Path,
+    src: Path,
+    width: int,
+    height: int,
+    args,
+    youtube_client_secrets: Path,
+    youtube_token_file: Path,
+    youtube_tags: List[str],
+) -> None:
+    if args.add_to_photos:
+        progress_print(args.progress, f"[phase photos] importing {out.name}")
+        print(f"Importing into Photos: {out.name}")
+        import_media_to_photos([out])
+    if args.youtube_upload:
+        youtube_title = build_youtube_title(out, src, f"{width}x{height}", args.youtube_title)
+        progress_print(args.progress, f"[phase youtube] uploading {out.name}")
+        print(f"Uploading to YouTube: {youtube_title}")
         video_id = upload_video_to_youtube(
-            video_path=upload_only_path,
+            video_path=out,
             title=youtube_title,
             description=args.youtube_description,
             tags=youtube_tags,
@@ -1388,9 +1428,26 @@ def main():
             token_file=youtube_token_file,
         )
         print(f"YouTube upload complete: https://www.youtube.com/watch?v={video_id}")
-        if args.add_to_photos:
-            print(f"Importing into Photos: {upload_only_path.name}")
-            import_media_to_photos([upload_only_path])
+
+
+def main():
+    t0 = time.time()
+    args = parse_args()
+    _validate_args(args)
+
+    upload_only_path = Path(args.youtube_upload_file) if args.youtube_upload_file else None
+    audio_path = Path(args.audio) if args.audio else None
+    outdir = Path(args.outdir)
+    ensure_dir(outdir)
+
+    preset = QUALITY_PRESETS[args.quality]
+    fps = args.fps if args.fps is not None else preset["fps"]
+    youtube_client_secrets = Path(args.youtube_client_secrets)
+    youtube_token_file = Path(args.youtube_token_file)
+    youtube_tags = parse_youtube_tags(args.youtube_tags)
+
+    if upload_only_path is not None:
+        _run_upload_only(args, upload_only_path, youtube_client_secrets, youtube_token_file, youtube_tags)
         return
 
     if not args.source_dir:
@@ -1406,11 +1463,13 @@ def main():
 
     try:
         blur = preset["blur_strength"]
-        bitrate = preset["bitrate"]
+        bitrate = args.bitrate if args.bitrate is not None else preset["bitrate"]
 
         do_geocode = args.geocode or args.location_stats or args.location_overlay
         extract_exif = args.sort_by in ("time", "location") or args.camera_stats or do_geocode
         detect_focus = args.smart_focus and args.motion_style in ("kenburns", "both")
+        if args.smart_focus and not detect_focus:
+            print(f"Warning: --smart-focus has no effect with --motion-style {args.motion_style}; use kenburns or both", file=sys.stderr)
         progress_print(args.progress, f"[phase prep] scanning {src}")
         if detect_focus:
             progress_print(args.progress, "[phase prep] initializing smart focus detectors")
@@ -1424,7 +1483,7 @@ def main():
             show_progress=args.progress,
         )
         if not images:
-            raise SystemExit("No supported images found.")
+            raise SystemExit(f"No supported images found in {src}. Supported: {', '.join(sorted(IMG_EXTS))}")
 
         progress_print(args.progress, f"[phase prep] ordering {len(images)} prepared images with sort={args.sort_by}")
         images, infos = sort_images_and_infos(images, infos, sort_by=args.sort_by, seed=args.seed)
@@ -1481,6 +1540,15 @@ def main():
                 args.xfade,
             )
 
+        render_kwargs_base = dict(
+            fps=fps, sec=args.sec, xfade=args.xfade, transition=args.transition,
+            blur_strength=blur, bitrate=bitrate, quality_name=args.quality,
+            encoder=encoder, motion_style=args.motion_style,
+            ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
+            motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
+            audio_path=audio_path,
+        )
+
         outputs = []
         for name, width, height in targets:
             out = outdir / name
@@ -1490,51 +1558,24 @@ def main():
                 if args.location_overlay
                 else None
             )
-            render(
-                images,
-                out,
-                width,
-                height,
-                fps=fps,
-                sec=args.sec,
-                xfade=args.xfade,
-                transition=args.transition,
-                blur_strength=blur,
-                bitrate=bitrate,
-                quality_name=args.quality,
-                encoder=encoder,
-                motion_style=args.motion_style,
-                ken_override=args.ken_burns_strength,
-                parallax_override=args.parallax_px,
-                motion_seed=args.seed,
-                rhythm_strength=args.rhythm_strength,
-                focal_points=focal_points,
-                label_overlay_paths=label_overlay_paths,
-                audio_path=audio_path,
-            )
-            outputs.append(out)
-            progress_print(args.progress, f"[phase render] completed {out.name}")
-
-            if args.add_to_photos:
-                progress_print(args.progress, f"[phase photos] importing {out.name}")
-                print(f"Importing into Photos: {out.name}")
-                import_media_to_photos([out])
-
-            if args.youtube_upload:
-                youtube_title = build_youtube_title(out, src, f"{width}x{height}", args.youtube_title)
-                progress_print(args.progress, f"[phase youtube] uploading {out.name}")
-                print(f"Uploading to YouTube: {youtube_title}")
-                video_id = upload_video_to_youtube(
-                    video_path=out,
-                    title=youtube_title,
-                    description=args.youtube_description,
-                    tags=youtube_tags,
-                    category=args.youtube_category,
-                    privacy=args.youtube_privacy,
-                    client_secrets=youtube_client_secrets,
-                    token_file=youtube_token_file,
+            if args.dry_run:
+                cmd, duration = build_render_command(
+                    images=images, out_path=out, width=width, height=height,
+                    focal_points=focal_points, label_overlay_paths=label_overlay_paths,
+                    **render_kwargs_base,
                 )
-                print(f"YouTube upload complete: https://www.youtube.com/watch?v={video_id}")
+                print(f"[dry-run] {width}x{height} estimated_duration={duration:.1f}s")
+                print(f"[dry-run] {' '.join(cmd)}")
+            else:
+                actual_encoder = render(
+                    images, out, width, height,
+                    focal_points=focal_points, label_overlay_paths=label_overlay_paths,
+                    **render_kwargs_base,
+                )
+                outputs.append(out)
+                note = f" (used {actual_encoder})" if actual_encoder != encoder else ""
+                progress_print(args.progress, f"[phase render] completed {out.name}{note}")
+                _post_render_output(out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
 
             if part_groups:
                 progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
@@ -1546,42 +1587,25 @@ def main():
                         if args.location_overlay
                         else None
                     )
-                    render(
-                        part_imgs, part_out, width, height,
-                        fps=fps, sec=args.sec, xfade=args.xfade,
-                        transition=args.transition, blur_strength=blur,
-                        bitrate=bitrate, quality_name=args.quality,
-                        encoder=encoder, motion_style=args.motion_style,
-                        ken_override=args.ken_burns_strength,
-                        parallax_override=args.parallax_px,
-                        motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
-                        focal_points=part_focal, label_overlay_paths=part_label_paths,
-                        audio_path=audio_path,
-                        audio_offset=part_audio_offsets[part_idx - 1],
-                    )
-                    outputs.append(part_out)
-                    progress_print(args.progress, f"[phase split] completed {part_out.name}")
-
-                    if args.add_to_photos:
-                        progress_print(args.progress, f"[phase photos] importing {part_out.name}")
-                        print(f"Importing into Photos: {part_out.name}")
-                        import_media_to_photos([part_out])
-
-                    if args.youtube_upload:
-                        part_title = build_youtube_title(part_out, src, f"{width}x{height}", args.youtube_title)
-                        progress_print(args.progress, f"[phase youtube] uploading {part_out.name}")
-                        print(f"Uploading to YouTube: {part_title}")
-                        part_id = upload_video_to_youtube(
-                            video_path=part_out,
-                            title=part_title,
-                            description=args.youtube_description,
-                            tags=youtube_tags,
-                            category=args.youtube_category,
-                            privacy=args.youtube_privacy,
-                            client_secrets=youtube_client_secrets,
-                            token_file=youtube_token_file,
+                    if args.dry_run:
+                        cmd, duration = build_render_command(
+                            images=part_imgs, out_path=part_out, width=width, height=height,
+                            focal_points=part_focal, label_overlay_paths=part_label_paths,
+                            audio_offset=part_audio_offsets[part_idx - 1],
+                            **render_kwargs_base,
                         )
-                        print(f"YouTube upload complete: https://www.youtube.com/watch?v={part_id}")
+                        print(f"[dry-run] part {part_idx} {width}x{height} estimated_duration={duration:.1f}s")
+                        print(f"[dry-run] {' '.join(cmd)}")
+                    else:
+                        render(
+                            part_imgs, part_out, width, height,
+                            focal_points=part_focal, label_overlay_paths=part_label_paths,
+                            audio_offset=part_audio_offsets[part_idx - 1],
+                            **render_kwargs_base,
+                        )
+                        outputs.append(part_out)
+                        progress_print(args.progress, f"[phase split] completed {part_out.name}")
+                        _post_render_output(part_out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
     except RuntimeError as exc:
         raise SystemExit(str(exc))
     else:
