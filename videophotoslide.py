@@ -5,6 +5,7 @@ A safer, cleaner slideshow generator derived from make_slideshow2.py.
 """
 
 import argparse
+import json
 import math
 import random
 import re
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,6 +105,8 @@ class PhotoInfo:
     camera_make: str = ""
     camera_model: str = ""
     focal_point: Optional[Tuple[float, float]] = None
+    altitude_m: Optional[float] = None
+    location_name: Optional[str] = None
 
     def __post_init__(self):
         if self.aspect_ratio > 1.1:
@@ -282,11 +286,22 @@ def resolve_transition_name(transition_mode: str, index: int) -> str:
     return transition_mode
 
 
+def _rational_to_float(val) -> float:
+    """Convert an EXIF rational value to float.
+
+    Pillow >= 8 returns IFDRational objects (float-like); older versions or
+    some TIFF-based formats return (numerator, denominator) tuples.
+    """
+    if isinstance(val, tuple):
+        return val[0] / val[1] if val[1] != 0 else 0.0
+    return float(val)
+
+
 def parse_gps_coord(gps_ref, gps_data):
     try:
-        d = gps_data[0][0] / gps_data[0][1]
-        m = gps_data[1][0] / gps_data[1][1]
-        s = gps_data[2][0] / gps_data[2][1]
+        d = _rational_to_float(gps_data[0])
+        m = _rational_to_float(gps_data[1])
+        s = _rational_to_float(gps_data[2])
         coord = d + m / 60.0 + s / 3600.0
         if gps_ref in ("S", "W"):
             coord = -coord
@@ -308,26 +323,52 @@ def extract_exif_datetime(image: Image.Image) -> Optional[datetime]:
     return None
 
 
+def _gps_ifd(image: Image.Image) -> Optional[dict]:
+    try:
+        return image.getexif().get_ifd(34853) or None
+    except Exception:
+        return None
+
+
+def _decode_gps_ref(val, default: str) -> str:
+    if val is None:
+        return default
+    return val.decode() if isinstance(val, bytes) else str(val)
+
+
 def extract_exif_gps(image: Image.Image) -> Optional[Tuple[float, float]]:
     try:
-        exif_data = image.getexif()
-        if not exif_data:
+        ifd = _gps_ifd(image)
+        if not ifd:
             return None
-        gps_ifd = exif_data.get(34853)
-        if not gps_ifd:
-            return None
-        gps_lat_ref = gps_ifd.get(1, b"N").decode() if isinstance(gps_ifd.get(1), bytes) else gps_ifd.get(1, "N")
-        gps_lon_ref = gps_ifd.get(3, b"E").decode() if isinstance(gps_ifd.get(3), bytes) else gps_ifd.get(3, "E")
-        gps_lat = gps_ifd.get(2)
-        gps_lon = gps_ifd.get(4)
+        lat_ref = _decode_gps_ref(ifd.get(1), "N")
+        lon_ref = _decode_gps_ref(ifd.get(3), "E")
+        gps_lat = ifd.get(2)
+        gps_lon = ifd.get(4)
         if gps_lat and gps_lon:
-            lat = parse_gps_coord(gps_lat_ref, gps_lat)
-            lon = parse_gps_coord(gps_lon_ref, gps_lon)
+            lat = parse_gps_coord(lat_ref, gps_lat)
+            lon = parse_gps_coord(lon_ref, gps_lon)
             if lat is not None and lon is not None:
                 return lat, lon
     except Exception:
         return None
     return None
+
+
+def extract_exif_altitude(image: Image.Image) -> Optional[float]:
+    try:
+        ifd = _gps_ifd(image)
+        if not ifd:
+            return None
+        alt = ifd.get(6)  # GPSAltitude
+        if alt is None:
+            return None
+        alt_m = _rational_to_float(alt)
+        if ifd.get(5, 0) == 1:  # GPSAltitudeRef: 1 = below sea level
+            alt_m = -alt_m
+        return alt_m
+    except Exception:
+        return None
 
 
 def extract_exif_camera(image: Image.Image) -> Tuple[str, str]:
@@ -352,6 +393,7 @@ def get_image_metadata(img_path: Path, image: Image.Image, extract_exif: bool, d
         aspect = width / height if height > 0 else 1.0
         dt_taken = extract_exif_datetime(image) if extract_exif else None
         gps = extract_exif_gps(image) if extract_exif else None
+        altitude = extract_exif_altitude(image) if extract_exif else None
         make, model = extract_exif_camera(image) if extract_exif else ("", "")
         focal_point = detect_subject_focus(image) if detect_focus else None
         return PhotoInfo(
@@ -363,6 +405,7 @@ def get_image_metadata(img_path: Path, image: Image.Image, extract_exif: bool, d
             orientation="",
             datetime_taken=dt_taken,
             gps_coords=gps,
+            altitude_m=altitude,
             camera_make=make,
             camera_model=model,
             focal_point=focal_point,
@@ -459,6 +502,90 @@ def convert_to_pngs(
     return images, infos
 
 
+def create_label_overlay_png(
+    location_lines: List[str],
+    altitude_str: Optional[str],
+    timestamp_str: Optional[str],
+    width: int,
+    height: int,
+    path: Path,
+) -> None:
+    """Render location label lines and altitude as a transparent RGBA PNG overlay.
+
+    Layout:
+    - Bottom-right: location lines, right-justified, auto-scaled to fit margin.
+    - Top-right:    altitude, smaller text, right-justified.
+    """
+    from PIL import ImageDraw, ImageFont
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    margin = max(20, min(width, height) // 40)
+    usable_w = width - 2 * margin
+    bpad = max(4, margin // 8)  # background box padding around each line
+
+    def load_font(size: int):
+        for candidate in (
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/SFNSDisplay.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ):
+            try:
+                return ImageFont.truetype(candidate, size, index=0)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def text_w(txt: str, fnt) -> int:
+        bb = draw.textbbox((0, 0), txt, font=fnt)
+        return int(bb[2] - bb[0])
+
+    def text_h(txt: str, fnt) -> int:
+        bb = draw.textbbox((0, 0), txt, font=fnt)
+        return int(bb[3] - bb[1])
+
+    def draw_label_line(txt: str, fnt, x: int, y: int) -> None:
+        tw = text_w(txt, fnt)
+        th = text_h(txt, fnt)
+        draw.rectangle([x - bpad, y - bpad, x + tw + bpad, y + th + bpad], fill=(0, 0, 0, 115))
+        draw.text((x, y), txt, font=fnt, fill=(255, 255, 255, 255))  # type: ignore[arg-type]
+
+    # --- Timestamp + altitude: top-right, stacked, smaller text ---
+    top_items = [s for s in (timestamp_str, altitude_str) if s]
+    if top_items:
+        top_size = max(12, height // 90)
+        top_font = load_font(top_size)
+        top_gap = max(3, top_size // 6)
+        top_step = text_h(top_items[0], top_font) + top_gap
+        for k, item in enumerate(top_items):
+            iw = text_w(item, top_font)
+            draw_label_line(item, top_font, width - margin - iw, margin + k * top_step)
+
+    # --- Location lines: bottom-right, auto-scaled, right-justified ---
+    if location_lines:
+        base_size = max(16, height // 54)
+        font = load_font(base_size)
+        widest = max(text_w(line, font) for line in location_lines)
+        if widest > usable_w:
+            scaled_size = max(16, int(base_size * usable_w / widest))
+            font = load_font(scaled_size)
+
+        line_gap = max(4, base_size // 8)
+        lh = text_h(location_lines[0], font)
+        line_step = lh + line_gap
+        pad_bottom = max(18, height // 54)
+        n = len(location_lines)
+
+        for j, line in enumerate(location_lines):
+            lw = text_w(line, font)
+            lx = width - margin - lw
+            ly = height - pad_bottom - (n - j) * line_step
+            draw_label_line(line, font, lx, ly)
+
+    img.save(str(path), "PNG")
+
+
 def build_filter_for_still(
     i,
     width,
@@ -536,20 +663,25 @@ def build_filter_for_still(
     return ";\n".join([bg, fg, comp])
 
 
-def build_xfade_chain(photo_durations: List[float], xfade, transition="auto"):
+def build_xfade_chain(
+    photo_durations: List[float],
+    xfade,
+    transition="auto",
+    stream_names: Optional[List[str]] = None,
+):
     n = len(photo_durations)
+    names = stream_names if stream_names is not None else [f"[v{i}]" for i in range(n)]
     if n == 1:
-        return "[v0]format=yuv420p[vout]"
+        return f"{names[0]}format=yuv420p[vout]"
     parts = []
-    cur = "[v0]"
+    cur = names[0]
     cumulative = photo_durations[0]
     for i in range(1, n):
         offset = cumulative - (i * xfade)
-        nxt = f"[v{i}]"
         out = f"[x{i}]"
         resolved_transition = resolve_transition_name(transition, i)
         parts.append(
-            f"{cur}{nxt}xfade=transition={resolved_transition}:duration={xfade}:offset={offset}{out}"
+            f"{cur}{names[i]}xfade=transition={resolved_transition}:duration={xfade}:offset={offset}{out}"
         )
         cur = out
         cumulative += photo_durations[i]
@@ -604,6 +736,7 @@ def build_render_command(
     motion_seed=0,
     rhythm_strength=0.12,
     focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
+    label_overlay_paths: Optional[List[Optional[Path]]] = None,
     audio_path: Optional[Path] = None,
     audio_offset: float = 0.0,
 ):
@@ -621,6 +754,17 @@ def build_render_command(
             cmd += ["-ss", str(audio_offset)]
         cmd += ["-i", str(audio_path)]
 
+    # Add label overlay PNG inputs (after photos + audio).
+    label_input_start = len(images) + (1 if audio_path is not None else 0)
+    label_input_map: dict = {}  # photo index -> ffmpeg input index
+    if label_overlay_paths:
+        next_idx = label_input_start
+        for i, lpath in enumerate(label_overlay_paths):
+            if lpath is not None:
+                cmd += ["-loop", "1", "-t", str(photo_durations[i]), "-i", str(lpath)]
+                label_input_map[i] = next_idx
+                next_idx += 1
+
     filters = [
         build_filter_for_still(
             i,
@@ -636,7 +780,22 @@ def build_render_command(
         )
         for i, still_sec in enumerate(photo_durations)
     ]
-    filter_complex = ";\n".join(filters) + ";\n" + build_xfade_chain(photo_durations, xfade, transition)
+
+    # For labeled photos: overlay the label PNG onto [v{i}] → [vl{i}].
+    overlay_filters = []
+    stream_names = []
+    for i in range(len(photo_durations)):
+        if i in label_input_map:
+            overlay_filters.append(f"[v{i}][{label_input_map[i]}:v]overlay=0:0[vl{i}]")
+            stream_names.append(f"[vl{i}]")
+        else:
+            stream_names.append(f"[v{i}]")
+
+    filter_parts = [";\n".join(filters)]
+    if overlay_filters:
+        filter_parts.append(";\n".join(overlay_filters))
+    filter_parts.append(build_xfade_chain(photo_durations, xfade, transition, stream_names))
+    filter_complex = ";\n".join(filter_parts)
 
     cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-r", str(fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
     if audio_path is not None:
@@ -656,6 +815,7 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
            bitrate="15M", quality_name="standard", encoder="h264_videotoolbox",
            motion_style="none", ken_override=None, parallax_override=None, motion_seed=0,
            rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
+           label_overlay_paths: Optional[List[Optional[Path]]] = None,
            audio_path: Optional[Path] = None,
            audio_offset: float = 0.0):
     render_kwargs = dict(
@@ -665,6 +825,7 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
         encoder=encoder, motion_style=motion_style, ken_override=ken_override,
         parallax_override=parallax_override, motion_seed=motion_seed,
         rhythm_strength=rhythm_strength, focal_points=focal_points,
+        label_overlay_paths=label_overlay_paths,
         audio_path=audio_path, audio_offset=audio_offset,
     )
     cmd, duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
@@ -750,6 +911,14 @@ def split_photos_into_parts(
     return parts
 
 
+def validate_transition(transition: str) -> str:
+    normalized = transition.strip().lower()
+    if normalized not in VALID_TRANSITIONS:
+        supported = ", ".join(sorted(VALID_TRANSITIONS))
+        raise argparse.ArgumentTypeError(f"must be one of: {supported}")
+    return normalized
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Create slideshow videos from photos.")
     ap.add_argument("source_dir", nargs="?")
@@ -760,6 +929,12 @@ def parse_args():
     ap.add_argument("--sort-by", default="natural", choices=["natural", "time", "location", "random"])
     ap.add_argument("--max-workers", type=int, default=0)
     ap.add_argument("--camera-stats", action="store_true")
+    ap.add_argument("--geocode", action="store_true",
+                    help="Reverse-geocode GPS coords via OpenStreetMap to populate location labels")
+    ap.add_argument("--location-stats", action="store_true",
+                    help="Print per-photo location labels (implies --geocode)")
+    ap.add_argument("--location-overlay", action="store_true",
+                    help="Burn location labels into the video as text (implies --geocode)")
     ap.add_argument("--motion-style", default="none", choices=["none", "kenburns", "parallax", "both"])
     ap.add_argument("--ken-burns-strength", type=float, default=None)
     ap.add_argument("--parallax-px", type=int, default=None)
@@ -769,7 +944,7 @@ def parse_args():
                     help="Show progress updates during preparation and rendering")
     ap.add_argument("--sec", type=float, default=2.8)
     ap.add_argument("--xfade", type=float, default=0.7)
-    ap.add_argument("--transition", default="auto", type=validate_transition, choices=TRANSITION_CHOICES)
+    ap.add_argument("--transition", default="auto", type=validate_transition)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rhythm-strength", type=float, default=0.12,
                     help="Per-photo timing variation strength (0.0 to 0.25)")
@@ -825,14 +1000,6 @@ def build_targets(fmt: str, stamp: str, input_dir_name: str, quality: str, trans
     return targets
 
 
-def validate_transition(transition: str) -> str:
-    normalized = transition.strip().lower()
-    if normalized not in VALID_TRANSITIONS:
-        supported = ", ".join(sorted(VALID_TRANSITIONS))
-        raise SystemExit(f"--transition must be one of: {supported}")
-    return normalized
-
-
 def print_camera_stats(infos: List[Optional[PhotoInfo]]) -> None:
     camera_counts = Counter()
     unknown_count = 0
@@ -857,6 +1024,135 @@ def print_camera_stats(infos: List[Optional[PhotoInfo]]) -> None:
         print(f"- {camera}: {count}")
     if unknown_count:
         print(f"- Unknown camera: {unknown_count}")
+
+
+# ---------------------------------------------------------------------------
+# Reverse geocoding via OpenStreetMap Nominatim (free, no API key required).
+# Rate-limited to 1 request/second per OSM policy.
+# ---------------------------------------------------------------------------
+
+_GEOCODE_CACHE: dict = {}
+_GEOCODE_LAST_CALL: float = 0.0
+
+
+def _nominatim_reverse(lat: float, lon: float) -> Optional[dict]:
+    global _GEOCODE_LAST_CALL
+    cache_key = (round(lat, 4), round(lon, 4))
+    if cache_key in _GEOCODE_CACHE:
+        return _GEOCODE_CACHE[cache_key]
+
+    elapsed = time.time() - _GEOCODE_LAST_CALL
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+
+    url = (
+        "https://nominatim.openstreetmap.org/reverse"
+        f"?lat={lat:.6f}&lon={lon:.6f}&format=json&zoom=16&addressdetails=1"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "videophotoslide/1.0 (personal slideshow tool)"},
+    )
+    try:
+        _GEOCODE_LAST_CALL = time.time()
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        _GEOCODE_CACHE[cache_key] = data
+        return data
+    except Exception:
+        _GEOCODE_CACHE[cache_key] = None
+        return None
+
+
+def _build_location_parts(
+    lat: float, lon: float, altitude_m: Optional[float]
+) -> Tuple[List[str], Optional[str]]:
+    """Return (location_lines, altitude_str) for overlay and stats use.
+
+    location_lines contains one entry per visual line (feature name, then
+    city/park context). altitude_str is formatted for a separate top-right
+    placement, or None if no altitude data.
+    """
+    data = _nominatim_reverse(lat, lon)
+    location_lines: List[str] = []
+
+    if data:
+        addr = data.get("address", {})
+        feature = data.get("name", "").strip()
+        outdoor_context = (
+            addr.get("protected_area")
+            or addr.get("nature_reserve")
+            or addr.get("national_park")
+            or addr.get("leisure")
+        )
+        city = (
+            addr.get("city")
+            or addr.get("town")
+            or addr.get("village")
+            or addr.get("hamlet")
+            or addr.get("suburb")
+        )
+        state = addr.get("state")
+        country_code = addr.get("country_code", "").upper()
+
+        if feature:
+            location_lines.append(feature)
+        if outdoor_context and outdoor_context != feature:
+            location_lines.append(outdoor_context)
+        if city:
+            location_lines.append(city)
+        if state:
+            location_lines.append(state)
+        if country_code not in ("US", ""):
+            country = addr.get("country", "")
+            if country:
+                location_lines.append(country)
+
+    altitude_str: Optional[str] = None
+    if altitude_m is not None:
+        ft = round(altitude_m * 3.28084)
+        altitude_str = f"{ft:,} ft"
+
+    return location_lines, altitude_str
+
+
+def build_location_label(lat: float, lon: float, altitude_m: Optional[float]) -> str:
+    """Human-readable single-string label (used for --location-stats output)."""
+    lines, alt = _build_location_parts(lat, lon, altitude_m)
+    return " · ".join(lines + ([alt] if alt else []))
+
+
+def geocode_photos(infos: List[Optional[PhotoInfo]], show_progress: bool = False) -> None:
+    """Reverse-geocode all photos that have GPS coords, mutating location_name in place."""
+    targets = [info for info in infos if info and info.gps_coords]
+    if not targets:
+        return
+    for count, info in enumerate(targets, start=1):
+        assert info is not None
+        lat, lon = info.gps_coords  # type: ignore[misc]
+        label = build_location_label(lat, lon, info.altitude_m)
+        info.location_name = label or None
+        if show_progress:
+            pct = (count / len(targets)) * 100.0
+            print(f"[geocode {count}/{len(targets)} {pct:5.1f}%] {label or '(no result)'}")
+
+
+def print_location_stats(infos: List[Optional[PhotoInfo]]) -> None:
+    print("\nLocation stats")
+    no_gps = sum(1 for info in infos if not info or not info.gps_coords)
+    labeled = [(info.path.name, info.location_name) for info in infos if info and info.location_name]
+    no_result = sum(1 for info in infos if info and info.gps_coords and not info.location_name)
+
+    if not labeled and no_gps == len(infos):
+        print("- No GPS data found in any image.")
+        return
+
+    for filename, label in labeled:
+        print(f"- {filename}: {label}")
+    if no_result:
+        print(f"- {no_result} image(s) with GPS but no geocode result")
+    if no_gps:
+        print(f"- {no_gps} image(s) without GPS data")
 
 
 def build_youtube_title(output_path: Path, input_dir: Path, fmt: str, custom_title: Optional[str]) -> str:
@@ -982,22 +1278,55 @@ def upload_video_to_youtube(
                 "privacyStatus": privacy,
             },
         },
-        media_body=MediaFileUpload(str(video_path), chunksize=-1, resumable=True),
+        media_body=MediaFileUpload(str(video_path), chunksize=5 * 1024 * 1024, resumable=True),
     )
 
     response = None
     retries = 0
+    last_pct = -1.0
     while response is None:
         try:
-            _, response = request.next_chunk()
+            status, response = request.next_chunk()
+            if status is not None:
+                pct = (status.resumable_progress / status.total_size) * 100.0
+                if pct - last_pct >= 1.0:
+                    print(f"\r[upload {pct:5.1f}%]", end="", flush=True)
+                    last_pct = pct
         except HttpError as exc:
             if exc.resp.status not in (500, 502, 503, 504) or retries >= 5:
                 raise
             retries += 1
-            print(f"Upload chunk failed (HTTP {exc.resp.status}), retrying ({retries}/5)...")
+            print(f"\nUpload chunk failed (HTTP {exc.resp.status}), retrying ({retries}/5)...")
             time.sleep(2 ** retries)
 
+    print(f"\r[upload 100.0%]")
     return response["id"]
+
+
+def build_label_overlay_paths_for_infos(
+    infos: List[Optional[PhotoInfo]],
+    width: int,
+    height: int,
+    temp_work: Path,
+    prefix: str,
+) -> Optional[List[Optional[Path]]]:
+    """Build per-photo label overlay PNGs. Returns None if no infos have location data."""
+    if not any(info.location_name if info else None for info in infos):
+        return None
+    result: List[Optional[Path]] = []
+    for i, info in enumerate(infos):
+        if info and info.location_name and info.gps_coords:
+            lines, alt = _build_location_parts(
+                info.gps_coords[0], info.gps_coords[1], info.altitude_m
+            )
+            if lines or alt:
+                p = temp_work / f"label_{prefix}_{width}x{height}_{i:06d}.png"
+                ts = info.datetime_taken.strftime("%-I:%M %p  ·  %b %-d, %Y") if info.datetime_taken else None
+                create_label_overlay_png(lines, alt, ts, width, height, p)
+                result.append(p)
+                continue
+        result.append(None)
+    return result
 
 
 def main():
@@ -1079,7 +1408,8 @@ def main():
         blur = preset["blur_strength"]
         bitrate = preset["bitrate"]
 
-        extract_exif = args.sort_by in ("time", "location") or args.camera_stats
+        do_geocode = args.geocode or args.location_stats or args.location_overlay
+        extract_exif = args.sort_by in ("time", "location") or args.camera_stats or do_geocode
         detect_focus = args.smart_focus and args.motion_style in ("kenburns", "both")
         progress_print(args.progress, f"[phase prep] scanning {src}")
         if detect_focus:
@@ -1100,6 +1430,11 @@ def main():
         images, infos = sort_images_and_infos(images, infos, sort_by=args.sort_by, seed=args.seed)
         if args.camera_stats:
             print_camera_stats(infos)
+        if do_geocode:
+            progress_print(args.progress, f"[phase geocode] reverse-geocoding {sum(1 for i in infos if i and i.gps_coords)} photos with GPS...")
+            geocode_photos(infos, show_progress=args.progress)
+        if args.location_stats:
+            print_location_stats(infos)
         focal_points = [info.focal_point if info else None for info in infos]
         if detect_focus:
             focused_count = sum(1 for point in focal_points if point is not None)
@@ -1150,6 +1485,11 @@ def main():
         for name, width, height in targets:
             out = outdir / name
             progress_print(args.progress, f"[phase render] starting {width}x{height} -> {out.name}")
+            label_overlay_paths = (
+                build_label_overlay_paths_for_infos(infos, width, height, temp_work, "main")
+                if args.location_overlay
+                else None
+            )
             render(
                 images,
                 out,
@@ -1169,6 +1509,7 @@ def main():
                 motion_seed=args.seed,
                 rhythm_strength=args.rhythm_strength,
                 focal_points=focal_points,
+                label_overlay_paths=label_overlay_paths,
                 audio_path=audio_path,
             )
             outputs.append(out)
@@ -1197,9 +1538,14 @@ def main():
 
             if part_groups:
                 progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
-                for part_idx, (part_imgs, _, part_focal) in enumerate(part_groups, start=1):
+                for part_idx, (part_imgs, part_infos, part_focal) in enumerate(part_groups, start=1):
                     part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
                     progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} images -> {part_out.name}")
+                    part_label_paths = (
+                        build_label_overlay_paths_for_infos(part_infos, width, height, temp_work, f"p{part_idx}")
+                        if args.location_overlay
+                        else None
+                    )
                     render(
                         part_imgs, part_out, width, height,
                         fps=fps, sec=args.sec, xfade=args.xfade,
@@ -1209,7 +1555,8 @@ def main():
                         ken_override=args.ken_burns_strength,
                         parallax_override=args.parallax_px,
                         motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
-                        focal_points=part_focal, audio_path=audio_path,
+                        focal_points=part_focal, label_overlay_paths=part_label_paths,
+                        audio_path=audio_path,
                         audio_offset=part_audio_offsets[part_idx - 1],
                     )
                     outputs.append(part_out)
