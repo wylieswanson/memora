@@ -89,7 +89,6 @@ VALID_TRANSITIONS = {
     "squeezev",
     "zoomin",
 }
-TRANSITION_CHOICES = sorted(VALID_TRANSITIONS)
 
 
 @dataclass
@@ -401,7 +400,7 @@ def get_image_metadata(img_path: Path, image: Image.Image, extract_exif: bool, d
             width=width,
             height=height,
             aspect_ratio=aspect,
-            is_landscape=(aspect > 1.1),
+            is_landscape=False,
             orientation="",
             datetime_taken=dt_taken,
             gps_coords=gps,
@@ -1138,8 +1137,7 @@ def geocode_photos(infos: List[Optional[PhotoInfo]], show_progress: bool = False
     if not targets:
         return
     for count, info in enumerate(targets, start=1):
-        assert info is not None
-        lat, lon = info.gps_coords  # type: ignore[misc]
+        lat, lon = info.gps_coords  # type: ignore[union-attr]
         label = build_location_label(lat, lon, info.altitude_m)
         info.location_name = label or None
         if show_progress:
@@ -1361,8 +1359,10 @@ def _validate_args(args) -> None:
         print(f"Warning: --split-secs ({args.split_secs}s) is less than --sec ({args.sec}s); every photo will be its own part", file=sys.stderr)
     if args.audio and not Path(args.audio).is_file():
         raise SystemExit(f"--audio file not found: {args.audio}")
-    if args.fps is not None and args.fps <= 0:
-        raise SystemExit("--fps must be > 0")
+    if args.fps is not None and args.fps < 12:
+        raise SystemExit("--fps must be at least 12")
+    if args.bitrate is not None and not re.match(r'^\d+[kKmMgG]?$', args.bitrate):
+        raise SystemExit("--bitrate must be a number with optional unit, e.g. 20M or 8000k")
 
 
 def _run_upload_only(
