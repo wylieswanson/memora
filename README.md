@@ -101,6 +101,9 @@ python videophotoslide.py ./input_photos
 | --smart-focus | off | Use MediaPipe face detection with pose fallback to bias Ken Burns framing |
 | --sort-by | natural | natural, time, location, random |
 | --seed | 0 | Seed for sort and pacing variation |
+| --clip-grade | full | Visual treatment for video clips: none, grade (color only), full (grade+vignette+grain) |
+| --clip-audio | mute | Clip audio handling: mute (silence), keep (mix with background), duck (lower background during clips) |
+| --audio | none | Path to background audio file to mix into the slideshow |
 | --youtube-upload | off | Upload each rendered output to YouTube after rendering |
 | --youtube-upload-file | off | Upload an existing rendered `.mp4` to YouTube without re-rendering |
 | --add-to-photos | off | Import rendered `.mp4` files into the macOS Photos app |
@@ -162,6 +165,8 @@ To publish directly after rendering:
 5. Run the script with `--youtube-upload`.
 
 On first upload, the script opens a browser for Google consent and stores a reusable token in `.youtube_token.json`.
+
+If `--youtube-upload` is enabled during a render, the script validates or refreshes the OAuth token before rendering starts so expired or revoked credentials fail fast instead of after a long render.
 
 If a render succeeds but upload fails, rerun with `--youtube-upload-file` pointed at the existing `.mp4` to retry the upload without rendering again.
 

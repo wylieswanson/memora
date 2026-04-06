@@ -16,7 +16,7 @@ import tempfile
 import time
 import urllib.request
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime
 from functools import lru_cache
 from multiprocessing import Pool, cpu_count
@@ -120,6 +120,27 @@ class PhotoInfo:
         else:
             self.is_landscape = False
             self.orientation = "square"
+
+
+@dataclass
+class RenderConfig:
+    fps: int = 30
+    sec: float = 2.8
+    xfade: float = 0.7
+    transition: str = "auto"
+    blur_strength: int = 18
+    bitrate: str = "15M"
+    quality_name: str = "standard"
+    encoder: str = "h264_videotoolbox"
+    motion_style: str = "none"
+    ken_override: Optional[float] = None
+    parallax_override: Optional[int] = None
+    motion_seed: int = 0
+    rhythm_strength: float = 0.12
+    audio_path: Optional[Path] = None
+    audio_offset: float = 0.0
+    clip_grade: str = "full"
+    clip_audio: str = "mute"
 
 
 def natural_key(s: str):
@@ -370,7 +391,13 @@ def build_media_durations(
     rhythm_strength: float,
     seed: int,
 ) -> List[float]:
-    """Per-item durations: video clips use natural duration; photos use rhythm-varied base_sec."""
+    """Per-item durations: video clips use natural duration; photos use rhythm-varied base_sec.
+
+    The rhythm wave is calculated across all len(infos) slots regardless of type,
+    so photo indices shift when clips are interleaved. This is intentional: the
+    wave is used only for photo slots and clip slots are overwritten with their
+    natural duration, so the resulting pacing is still musically coherent.
+    """
     photo_durations = build_photo_durations(len(infos), base_sec, xfade, rhythm_strength, seed)
     min_clip_dur = max(xfade + 0.1, 0.5)
     return [
@@ -543,12 +570,18 @@ def convert_to_pngs(
     detect_focus: bool = False,
     max_workers: int = 0,
     show_progress: bool = False,
-) -> Tuple[List[Path], List[Optional[PhotoInfo]]]:
+) -> Tuple[List[Path], List[Optional[PhotoInfo]], dict]:
+    """Convert images to normalized PNGs.
+
+    Returns (png_paths, infos, src_to_png) where src_to_png maps each original
+    source Path to its output PNG Path. collect_media uses this mapping directly
+    rather than reverse-engineering it from PNG filenames.
+    """
     ensure_dir(work_dir)
     files = sorted(input_dir.iterdir(), key=lambda x: natural_key(x.name))
     image_files = [p for p in files if p.suffix.lower() in IMG_EXTS]
     if not image_files:
-        return [], []
+        return [], [], {}
 
     args_list = [(p, i, work_dir, extract_exif, detect_focus) for i, p in enumerate(image_files)]
     progress_every = 1 if len(image_files) <= 10 else 5
@@ -594,14 +627,15 @@ def convert_to_pngs(
             emit_progress(processed, focus_hits)
             results.append(result)
 
-    images, infos = [], []
+    images, infos, src_to_png = [], [], {}
     for _idx, out, info, err in sorted(results, key=lambda item: item[0]):
         if err:
             print(f"Skipping: {err}", file=sys.stderr)
         else:
             images.append(out)
             infos.append(info)
-    return images, infos
+            src_to_png[image_files[_idx]] = out
+    return images, infos, src_to_png
 
 
 def collect_media(
@@ -628,26 +662,19 @@ def collect_media(
         return [], []
 
     # Process images via existing parallel pipeline.
-    img_paths: List[Path] = []
-    img_infos: List[Optional[PhotoInfo]] = []
+    # src_to_png maps each original source Path → its PNG output Path directly.
+    img_file_result: dict = {}
     if img_files:
-        img_paths, img_infos = convert_to_pngs(
+        img_paths, img_infos, src_to_png = convert_to_pngs(
             input_dir, work_dir,
             extract_exif=extract_exif,
             detect_focus=detect_focus,
             max_workers=max_workers,
             show_progress=show_progress,
         )
-
-    # Map each original image file to its PNG output using the idx embedded in the PNG name.
-    # PNG names are "{idx:06d}_{stem}.png" where idx is the image's position in img_files.
-    img_file_result: dict = {}
-    for png_path, info in zip(img_paths, img_infos):
-        try:
-            idx = int(png_path.stem.split("_", 1)[0])
-            img_file_result[img_files[idx]] = (png_path, info)
-        except (ValueError, IndexError):
-            pass
+        png_to_info = dict(zip(img_paths, img_infos))
+        for src, png_path in src_to_png.items():
+            img_file_result[src] = (png_path, png_to_info[png_path])
 
     # Probe video clips (serial — typically few clips).
     vid_file_result: dict = {}
@@ -760,17 +787,17 @@ def create_label_overlay_png(
 
 
 def build_filter_for_still(
-    i,
-    width,
-    height,
-    fps,
-    sec,
-    blur_strength=18,
-    ken_strength=0.0,
-    parallax_px=0,
-    motion_seed=0,
+    i: int,
+    width: int,
+    height: int,
+    fps: int,
+    sec: float,
+    blur_strength: int = 18,
+    ken_strength: float = 0.0,
+    parallax_px: int = 0,
+    motion_seed: int = 0,
     focal_point: Optional[Tuple[float, float]] = None,
-):
+) -> str:
     local_rng = random.Random(motion_seed + i * 101)
 
     u = f"(t/{sec})"
@@ -983,38 +1010,22 @@ def run_ffmpeg_with_progress(cmd: List[str], total_duration: float):
 
 
 def build_render_command(
-    images,
+    images: List[Path],
     out_path: Path,
-    width,
-    height,
-    fps=30,
-    sec=2.8,
-    xfade=0.7,
-    transition="auto",
-    blur_strength=18,
-    bitrate="15M",
-    quality_name="standard",
-    encoder="h264_videotoolbox",
-    motion_style="none",
-    ken_override=None,
-    parallax_override=None,
-    motion_seed=0,
-    rhythm_strength=0.12,
+    width: int,
+    height: int,
+    cfg: RenderConfig,
     focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
     label_overlay_paths: Optional[List[Optional[Path]]] = None,
-    audio_path: Optional[Path] = None,
-    audio_offset: float = 0.0,
     infos: Optional[List[Optional[PhotoInfo]]] = None,
-    clip_grade: str = "full",
-    clip_audio: str = "mute",
-):
+) -> Tuple[List[str], float]:
     infos_list: List[Optional[PhotoInfo]] = infos if infos is not None else [None] * len(images)
-    media_durations = build_media_durations(infos_list, sec, xfade, rhythm_strength, motion_seed)
-    duration = estimate_duration_variable(media_durations, xfade)
-    ken, para = resolve_motion_values(motion_style, ken_override, parallax_override, min(width, height), sec)
+    media_durations = build_media_durations(infos_list, cfg.sec, cfg.xfade, cfg.rhythm_strength, cfg.motion_seed)
+    duration = estimate_duration_variable(media_durations, cfg.xfade)
+    ken, para = resolve_motion_values(cfg.motion_style, cfg.ken_override, cfg.parallax_override, min(width, height), cfg.sec)
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"]
-    if encoder == "h264_videotoolbox":
+    if cfg.encoder == "h264_videotoolbox":
         cmd += ["-hwaccel", "videotoolbox"]
 
     # Inputs: video clips use plain -i; still images use -loop 1 -t <dur>.
@@ -1024,14 +1035,14 @@ def build_render_command(
         else:
             cmd += ["-loop", "1", "-t", str(item_dur), "-i", str(img)]
 
-    if audio_path is not None:
-        if audio_offset > 0:
-            cmd += ["-ss", str(audio_offset)]
-        cmd += ["-i", str(audio_path)]
+    if cfg.audio_path is not None:
+        if cfg.audio_offset > 0:
+            cmd += ["-ss", str(cfg.audio_offset)]
+        cmd += ["-i", str(cfg.audio_path)]
 
     # Add label overlay PNG inputs (after media + audio).
-    audio_input_idx = len(images) if audio_path is not None else None
-    label_input_start = len(images) + (1 if audio_path is not None else 0)
+    audio_input_idx = len(images) if cfg.audio_path is not None else None
+    label_input_start = len(images) + (1 if cfg.audio_path is not None else 0)
     label_input_map: dict = {}  # media index -> ffmpeg input index
     if label_overlay_paths:
         next_idx = label_input_start
@@ -1045,11 +1056,11 @@ def build_render_command(
     filters = []
     for i, (item_dur, info) in enumerate(zip(media_durations, infos_list)):
         if info and info.is_video:
-            filters.append(build_filter_for_clip(i, width, height, fps, item_dur, blur_strength, clip_grade))
+            filters.append(build_filter_for_clip(i, width, height, cfg.fps, item_dur, cfg.blur_strength, cfg.clip_grade))
         else:
             filters.append(build_filter_for_still(
-                i, width, height, fps, item_dur,
-                blur_strength, ken, para, motion_seed,
+                i, width, height, cfg.fps, item_dur,
+                cfg.blur_strength, ken, para, cfg.motion_seed,
                 focal_points[i] if focal_points else None,
             ))
 
@@ -1066,73 +1077,64 @@ def build_render_command(
     filter_parts = [";\n".join(filters)]
     if overlay_filters:
         filter_parts.append(";\n".join(overlay_filters))
-    filter_parts.append(build_xfade_chain(media_durations, xfade, transition, stream_names))
+    filter_parts.append(build_xfade_chain(media_durations, cfg.xfade, cfg.transition, stream_names))
 
     # Audio: use filter-complex mixing when clips have audible audio (keep/duck);
     # otherwise fall back to the simple -map + -af apad approach.
     has_video_clips = any(info and info.is_video for info in infos_list)
-    use_complex_audio = has_video_clips and clip_audio != "mute"
+    use_complex_audio = has_video_clips and cfg.clip_audio != "mute"
     audio_filter = ""
     if use_complex_audio:
         audio_filter = _build_clip_audio_filters(
-            infos_list, media_durations, xfade, audio_input_idx, clip_audio
+            infos_list, media_durations, cfg.xfade, audio_input_idx, cfg.clip_audio
         )
         if audio_filter:
             filter_parts.append(audio_filter)
 
     filter_complex = ";\n".join(filter_parts)
-    cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-r", str(fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-r", str(cfg.fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
 
     if use_complex_audio and audio_filter:
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-shortest"]
-    elif audio_path is not None:
+    elif cfg.audio_path is not None:
         cmd += ["-map", f"{len(images)}:a", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
 
-    if encoder == "h264_videotoolbox":
-        cmd += ["-c:v", "h264_videotoolbox", "-b:v", bitrate]
+    if cfg.encoder == "h264_videotoolbox":
+        cmd += ["-c:v", "h264_videotoolbox", "-b:v", cfg.bitrate]
     else:
-        crf, preset = x264_tuning_for_quality(quality_name)
+        crf, preset = x264_tuning_for_quality(cfg.quality_name)
         cmd += ["-c:v", "libx264", "-crf", crf, "-preset", preset]
 
     cmd += [str(out_path)]
     return cmd, duration
 
 
-def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, transition="auto", blur_strength=18,
-           bitrate="15M", quality_name="standard", encoder="h264_videotoolbox",
-           motion_style="none", ken_override=None, parallax_override=None, motion_seed=0,
-           rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
-           label_overlay_paths: Optional[List[Optional[Path]]] = None,
-           audio_path: Optional[Path] = None, audio_offset: float = 0.0,
-           infos: Optional[List[Optional[PhotoInfo]]] = None,
-           clip_grade: str = "full", clip_audio: str = "mute") -> str:
+def render(
+    images: List[Path],
+    out_path: Path,
+    width: int,
+    height: int,
+    cfg: RenderConfig,
+    focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
+    label_overlay_paths: Optional[List[Optional[Path]]] = None,
+    infos: Optional[List[Optional[PhotoInfo]]] = None,
+) -> str:
     """Run the render and return the encoder actually used."""
-    render_kwargs = dict(
-        images=images, out_path=out_path, width=width, height=height,
-        fps=fps, sec=sec, xfade=xfade, transition=transition,
-        blur_strength=blur_strength, bitrate=bitrate, quality_name=quality_name,
-        encoder=encoder, motion_style=motion_style, ken_override=ken_override,
-        parallax_override=parallax_override, motion_seed=motion_seed,
-        rhythm_strength=rhythm_strength, focal_points=focal_points,
-        label_overlay_paths=label_overlay_paths,
-        audio_path=audio_path, audio_offset=audio_offset,
-        infos=infos, clip_grade=clip_grade, clip_audio=clip_audio,
-    )
-    cmd, duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
+    cmd, duration = build_render_command(images, out_path, width, height, cfg, focal_points, label_overlay_paths, infos)
     try:
         run_ffmpeg_with_progress(cmd, duration)
-        return encoder
+        return cfg.encoder
     except RuntimeError as exc:
         message = str(exc)
         videotoolbox_failed = (
-            encoder == "h264_videotoolbox"
+            cfg.encoder == "h264_videotoolbox"
             and ("Error while opening encoder" in message or "Could not open encoder" in message)
         )
         if not videotoolbox_failed:
             raise
         print("VideoToolbox encoder failed; retrying with libx264")
-        render_kwargs["encoder"] = "libx264"
-        fallback_cmd, fallback_duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
+        fallback_cfg = dataclass_replace(cfg, encoder="libx264")
+        fallback_cmd, fallback_duration = build_render_command(images, out_path, width, height, fallback_cfg, focal_points, label_overlay_paths, infos)
         run_ffmpeg_with_progress(fallback_cmd, fallback_duration)
         return "libx264"
 
@@ -1534,8 +1536,11 @@ def _load_youtube_credentials(token_file: Path, client_secrets: Path):
         creds = Credentials.from_authorized_user_file(str(token_file), scopes)
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    elif not creds or not creds.valid:
+        try:
+            creds.refresh(Request())
+        except Exception:
+            creds = None
+    if not creds or not creds.valid:
         if not client_secrets.exists():
             raise SystemExit(f"Missing YouTube OAuth client secrets file: {client_secrets}")
         flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), scopes)
@@ -1659,6 +1664,15 @@ def _validate_args(args) -> None:
         raise SystemExit("--bitrate must be a number with optional unit, e.g. 20M or 8000k")
 
 
+def _preflight_youtube_upload(
+    client_secrets: Path,
+    token_file: Path,
+    show_progress: bool,
+) -> None:
+    progress_print(show_progress, "[phase youtube] validating upload credentials before render")
+    _load_youtube_credentials(token_file=token_file, client_secrets=client_secrets)
+
+
 def _run_upload_only(
     args,
     upload_only_path: Path,
@@ -1751,6 +1765,13 @@ def main():
     if not src.exists() or not src.is_dir():
         raise SystemExit(f"Missing source directory: {src}")
 
+    if args.youtube_upload:
+        _preflight_youtube_upload(
+            client_secrets=youtube_client_secrets,
+            token_file=youtube_token_file,
+            show_progress=args.progress,
+        )
+
     parent = Path(args.workdir).parent if Path(args.workdir).parent != Path("") else Path(".")
     ensure_dir(parent)
     temp_work = Path(tempfile.mkdtemp(prefix="videophotoslide_", dir=str(parent)))
@@ -1839,7 +1860,7 @@ def main():
                 args.xfade,
             )
 
-        render_kwargs_base = dict(
+        base_cfg = RenderConfig(
             fps=fps, sec=args.sec, xfade=args.xfade, transition=args.transition,
             blur_strength=blur, bitrate=bitrate, quality_name=args.quality,
             encoder=encoder, motion_style=args.motion_style,
@@ -1860,19 +1881,17 @@ def main():
             )
             if args.dry_run:
                 cmd, duration = build_render_command(
-                    images=images, out_path=out, width=width, height=height,
+                    images, out, width, height, base_cfg,
                     focal_points=focal_points, label_overlay_paths=label_overlay_paths,
                     infos=infos,
-                    **render_kwargs_base,
                 )
                 print(f"[dry-run] {width}x{height} estimated_duration={duration:.1f}s")
                 print(f"[dry-run] {' '.join(cmd)}")
             else:
                 actual_encoder = render(
-                    images, out, width, height,
+                    images, out, width, height, base_cfg,
                     focal_points=focal_points, label_overlay_paths=label_overlay_paths,
                     infos=infos,
-                    **render_kwargs_base,
                 )
                 outputs.append(out)
                 note = f" (used {actual_encoder})" if actual_encoder != encoder else ""
@@ -1889,23 +1908,20 @@ def main():
                         if args.location_overlay
                         else None
                     )
+                    part_cfg = dataclass_replace(base_cfg, audio_offset=part_audio_offsets[part_idx - 1])
                     if args.dry_run:
                         cmd, duration = build_render_command(
-                            images=part_imgs, out_path=part_out, width=width, height=height,
+                            part_imgs, part_out, width, height, part_cfg,
                             focal_points=part_focal, label_overlay_paths=part_label_paths,
-                            audio_offset=part_audio_offsets[part_idx - 1],
                             infos=part_infos,
-                            **render_kwargs_base,
                         )
                         print(f"[dry-run] part {part_idx} {width}x{height} estimated_duration={duration:.1f}s")
                         print(f"[dry-run] {' '.join(cmd)}")
                     else:
                         render(
-                            part_imgs, part_out, width, height,
+                            part_imgs, part_out, width, height, part_cfg,
                             focal_points=part_focal, label_overlay_paths=part_label_paths,
-                            audio_offset=part_audio_offsets[part_idx - 1],
                             infos=part_infos,
-                            **render_kwargs_base,
                         )
                         outputs.append(part_out)
                         progress_print(args.progress, f"[phase split] completed {part_out.name}")

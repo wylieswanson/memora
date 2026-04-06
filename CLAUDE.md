@@ -17,6 +17,7 @@ Key output characteristics:
 **Single file**: `videophotoslide.py` (~1,900 lines). No separate modules.
 
 **Processing pipeline** (in execution order):
+0. If `--youtube-upload` is set, validate/refresh YouTube OAuth credentials before rendering so auth failures happen early
 1. Scan input dir for supported files → `IMG_EXTS` + `VID_EXTS`
 2. Images: convert to normalized PNG in parallel → `convert_to_pngs()` / `_convert_single_image()`
    Video clips: probe via ffprobe → `probe_video_clip()`
