@@ -27,6 +27,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".heic", ".heif"}
+VID_EXTS = {".mp4", ".mov"}
 
 QUALITY_PRESETS = {
     "draft": {"fps": 24, "blur_strength": 12, "bitrate": "8M", "description": "Fast preview"},
@@ -106,6 +107,8 @@ class PhotoInfo:
     focal_point: Optional[Tuple[float, float]] = None
     altitude_m: Optional[float] = None
     location_name: Optional[str] = None
+    is_video: bool = False
+    video_duration: Optional[float] = None
 
     def __post_init__(self):
         if self.aspect_ratio > 1.1:
@@ -203,6 +206,78 @@ def detect_subject_focus(image: Image.Image) -> Optional[Tuple[float, float]]:
     return None
 
 
+def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
+    """Use ffprobe to extract video metadata. Returns a PhotoInfo with is_video=True, or None on failure."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+
+    video_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+        None,
+    )
+    if video_stream is None:
+        return None
+
+    width = int(video_stream.get("width", 0))
+    height = int(video_stream.get("height", 0))
+    if width <= 0 or height <= 0:
+        return None
+
+    raw_dur = video_stream.get("duration") or data.get("format", {}).get("duration")
+    if not raw_dur:
+        return None
+    try:
+        duration = float(raw_dur)
+    except ValueError:
+        return None
+    if duration <= 0:
+        return None
+
+    ar = width / height
+
+    # creation_time: prefer MP4/MOV container tags, fall back to file mtime.
+    datetime_taken: Optional[datetime] = None
+    fmt_tags = {k.lower(): v for k, v in data.get("format", {}).get("tags", {}).items()}
+    ct = fmt_tags.get("creation_time") or fmt_tags.get("com.apple.quicktime.creationdate")
+    if ct:
+        for fmt_str in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                datetime_taken = datetime.strptime(ct, fmt_str)
+                break
+            except ValueError:
+                pass
+    if datetime_taken is None:
+        try:
+            datetime_taken = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            pass
+
+    return PhotoInfo(
+        path=path,
+        width=width,
+        height=height,
+        aspect_ratio=ar,
+        is_landscape=ar > 1.1,
+        orientation="landscape" if ar > 1.1 else ("portrait" if ar < 0.9 else "square"),
+        datetime_taken=datetime_taken,
+        is_video=True,
+        video_duration=duration,
+    )
+
+
 def estimate_duration_variable(photo_durations: List[float], xfade_seconds: float) -> float:
     if not photo_durations:
         return 0.0
@@ -276,6 +351,34 @@ def build_photo_durations(
         sec = base_sec * (1.0 + delta)
         durations.append(max(min_sec, sec))
     return durations
+
+
+def _media_start_times(media_durations: List[float], xfade: float) -> List[float]:
+    """Compute the timeline start time of each media item accounting for xfade overlap."""
+    if not media_durations:
+        return []
+    starts = [0.0]
+    for i in range(1, len(media_durations)):
+        starts.append(starts[-1] + media_durations[i - 1] - xfade)
+    return starts
+
+
+def build_media_durations(
+    infos: List[Optional["PhotoInfo"]],
+    base_sec: float,
+    xfade: float,
+    rhythm_strength: float,
+    seed: int,
+) -> List[float]:
+    """Per-item durations: video clips use natural duration; photos use rhythm-varied base_sec."""
+    photo_durations = build_photo_durations(len(infos), base_sec, xfade, rhythm_strength, seed)
+    min_clip_dur = max(xfade + 0.1, 0.5)
+    return [
+        max(info.video_duration, min_clip_dur)
+        if (info and info.is_video and info.video_duration is not None)
+        else dur
+        for dur, info in zip(photo_durations, infos)
+    ]
 
 
 def resolve_transition_name(transition_mode: str, index: int) -> str:
@@ -501,6 +604,77 @@ def convert_to_pngs(
     return images, infos
 
 
+def collect_media(
+    input_dir: Path,
+    work_dir: Path,
+    extract_exif: bool = True,
+    detect_focus: bool = False,
+    max_workers: int = 0,
+    show_progress: bool = False,
+) -> Tuple[List[Path], List[Optional[PhotoInfo]]]:
+    """Collect images + video clips from input_dir in natural sort order.
+
+    Images are converted to normalized PNGs. Video clips are probed via ffprobe
+    and kept at their original paths. Returns a unified list maintaining natural
+    filename order across both media types.
+    """
+    ensure_dir(work_dir)
+    all_files = sorted(input_dir.iterdir(), key=lambda x: natural_key(x.name))
+    img_files = [p for p in all_files if p.suffix.lower() in IMG_EXTS]
+    vid_files = [p for p in all_files if p.suffix.lower() in VID_EXTS]
+    all_media = [p for p in all_files if p.suffix.lower() in IMG_EXTS | VID_EXTS]
+
+    if not all_media:
+        return [], []
+
+    # Process images via existing parallel pipeline.
+    img_paths: List[Path] = []
+    img_infos: List[Optional[PhotoInfo]] = []
+    if img_files:
+        img_paths, img_infos = convert_to_pngs(
+            input_dir, work_dir,
+            extract_exif=extract_exif,
+            detect_focus=detect_focus,
+            max_workers=max_workers,
+            show_progress=show_progress,
+        )
+
+    # Map each original image file to its PNG output using the idx embedded in the PNG name.
+    # PNG names are "{idx:06d}_{stem}.png" where idx is the image's position in img_files.
+    img_file_result: dict = {}
+    for png_path, info in zip(img_paths, img_infos):
+        try:
+            idx = int(png_path.stem.split("_", 1)[0])
+            img_file_result[img_files[idx]] = (png_path, info)
+        except (ValueError, IndexError):
+            pass
+
+    # Probe video clips (serial — typically few clips).
+    vid_file_result: dict = {}
+    for vf in vid_files:
+        progress_print(show_progress, f"[prep probe] {vf.name}")
+        vinfo = probe_video_clip(vf)
+        if vinfo is None:
+            print(f"Skipping video (probe failed): {vf.name}", file=sys.stderr)
+        else:
+            vid_file_result[vf] = (vf, vinfo)
+
+    # Merge in original natural sort order.
+    paths: List[Path] = []
+    infos: List[Optional[PhotoInfo]] = []
+    for p in all_media:
+        if p in img_file_result:
+            png_path, info = img_file_result[p]
+            paths.append(png_path)
+            infos.append(info)
+        elif p in vid_file_result:
+            vid_path, vinfo = vid_file_result[p]
+            paths.append(vid_path)
+            infos.append(vinfo)
+
+    return paths, infos
+
+
 def create_label_overlay_png(
     location_lines: List[str],
     altitude_str: Optional[str],
@@ -662,6 +836,45 @@ def build_filter_for_still(
     return ";\n".join([bg, fg, comp])
 
 
+def build_filter_for_clip(
+    i: int,
+    width: int,
+    height: int,
+    fps: int,
+    duration: float,
+    blur_strength: int = 18,
+    clip_grade: str = "full",
+) -> str:
+    """Build ffmpeg filter chain for a video clip. No still-image looping, no motion applied."""
+    bg = (
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+        f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
+        f"fps={fps},trim=duration={duration:.3f},setpts=PTS-STARTPTS[bg{i}]"
+    )
+    fg = (
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,"
+        f"fps={fps},trim=duration={duration:.3f},setpts=PTS-STARTPTS[fg{i}]"
+    )
+    overlay = "overlay=(W-w)/2:(H-h)/2"
+    if clip_grade == "none":
+        comp = f"[bg{i}][fg{i}]{overlay},format=yuv420p[v{i}]"
+    elif clip_grade == "grade":
+        comp = (
+            f"[bg{i}][fg{i}]{overlay},"
+            "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
+            f"format=yuv420p[v{i}]"
+        )
+    else:  # "full"
+        comp = (
+            f"[bg{i}][fg{i}]{overlay},"
+            "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
+            "vignette=PI/10,"
+            "noise=alls=3:allf=t+u,"
+            f"format=yuv420p[v{i}]"
+        )
+    return ";\n".join([bg, fg, comp])
+
+
 def build_xfade_chain(
     photo_durations: List[float],
     xfade,
@@ -686,6 +899,58 @@ def build_xfade_chain(
         cumulative += photo_durations[i]
     total = estimate_duration_variable(photo_durations, xfade)
     parts.append(f"{cur}trim=duration={total},format=yuv420p[vout]")
+    return ";\n".join(parts)
+
+
+def _build_clip_audio_filters(
+    infos_list: List[Optional[PhotoInfo]],
+    media_durations: List[float],
+    xfade: float,
+    audio_input_idx: Optional[int],
+    clip_audio: str,
+) -> str:
+    """Build audio filter complex fragment for keep/duck modes. Returns fragment producing [aout].
+
+    audio_input_idx: ffmpeg input index of the background --audio file, or None if not provided.
+    clip_audio: "keep" (mix clip audio with background at full volume) or
+                "duck" (lower background to 20% during clip playback).
+    """
+    start_times = _media_start_times(media_durations, xfade)
+    clip_items = [
+        (i, start_times[i], start_times[i] + media_durations[i])
+        for i, info in enumerate(infos_list)
+        if info and info.is_video
+    ]
+
+    parts: List[str] = []
+    mix_labels: List[str] = []
+
+    if audio_input_idx is not None:
+        if clip_audio == "duck" and clip_items:
+            conds = "+".join(f"between(t,{s:.3f},{e:.3f})" for _, s, e in clip_items)
+            vol = f"if(gt({conds},0),0.2,1.0)"
+            parts.append(f"[{audio_input_idx}:a]volume='{vol}':eval=frame,apad[bg_a]")
+        else:
+            parts.append(f"[{audio_input_idx}:a]apad[bg_a]")
+        mix_labels.append("[bg_a]")
+
+    for seq, (clip_idx, start, end) in enumerate(clip_items):
+        delay_ms = int(start * 1000)
+        clip_dur = end - start
+        parts.append(
+            f"[{clip_idx}:a]atrim=duration={clip_dur:.3f},adelay={delay_ms}:all=1[ca{seq}]"
+        )
+        mix_labels.append(f"[ca{seq}]")
+
+    if not mix_labels:
+        return ""
+
+    if len(mix_labels) == 1:
+        parts.append(f"{mix_labels[0]}anull[aout]")
+    else:
+        joined = "".join(mix_labels)
+        parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[aout]")
+
     return ";\n".join(parts)
 
 
@@ -739,52 +1004,59 @@ def build_render_command(
     label_overlay_paths: Optional[List[Optional[Path]]] = None,
     audio_path: Optional[Path] = None,
     audio_offset: float = 0.0,
+    infos: Optional[List[Optional[PhotoInfo]]] = None,
+    clip_grade: str = "full",
+    clip_audio: str = "mute",
 ):
-    photo_durations = build_photo_durations(len(images), sec, xfade, rhythm_strength, motion_seed)
-    duration = estimate_duration_variable(photo_durations, xfade)
+    infos_list: List[Optional[PhotoInfo]] = infos if infos is not None else [None] * len(images)
+    media_durations = build_media_durations(infos_list, sec, xfade, rhythm_strength, motion_seed)
+    duration = estimate_duration_variable(media_durations, xfade)
     ken, para = resolve_motion_values(motion_style, ken_override, parallax_override, min(width, height), sec)
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats"]
     if encoder == "h264_videotoolbox":
         cmd += ["-hwaccel", "videotoolbox"]
-    for img, still_sec in zip(images, photo_durations):
-        cmd += ["-loop", "1", "-t", str(still_sec), "-i", str(img)]
+
+    # Inputs: video clips use plain -i; still images use -loop 1 -t <dur>.
+    for img, info, item_dur in zip(images, infos_list, media_durations):
+        if info and info.is_video:
+            cmd += ["-i", str(img)]
+        else:
+            cmd += ["-loop", "1", "-t", str(item_dur), "-i", str(img)]
+
     if audio_path is not None:
         if audio_offset > 0:
             cmd += ["-ss", str(audio_offset)]
         cmd += ["-i", str(audio_path)]
 
-    # Add label overlay PNG inputs (after photos + audio).
+    # Add label overlay PNG inputs (after media + audio).
+    audio_input_idx = len(images) if audio_path is not None else None
     label_input_start = len(images) + (1 if audio_path is not None else 0)
-    label_input_map: dict = {}  # photo index -> ffmpeg input index
+    label_input_map: dict = {}  # media index -> ffmpeg input index
     if label_overlay_paths:
         next_idx = label_input_start
         for i, lpath in enumerate(label_overlay_paths):
             if lpath is not None:
-                cmd += ["-loop", "1", "-t", str(photo_durations[i]), "-i", str(lpath)]
+                cmd += ["-loop", "1", "-t", str(media_durations[i]), "-i", str(lpath)]
                 label_input_map[i] = next_idx
                 next_idx += 1
 
-    filters = [
-        build_filter_for_still(
-            i,
-            width,
-            height,
-            fps,
-            still_sec,
-            blur_strength,
-            ken,
-            para,
-            motion_seed,
-            focal_points[i] if focal_points else None,
-        )
-        for i, still_sec in enumerate(photo_durations)
-    ]
+    # Per-item video filters: clips skip motion; photos get full still treatment.
+    filters = []
+    for i, (item_dur, info) in enumerate(zip(media_durations, infos_list)):
+        if info and info.is_video:
+            filters.append(build_filter_for_clip(i, width, height, fps, item_dur, blur_strength, clip_grade))
+        else:
+            filters.append(build_filter_for_still(
+                i, width, height, fps, item_dur,
+                blur_strength, ken, para, motion_seed,
+                focal_points[i] if focal_points else None,
+            ))
 
-    # For labeled photos: overlay the label PNG onto [v{i}] → [vl{i}].
+    # Label overlays: composite label PNG onto each labeled stream.
     overlay_filters = []
     stream_names = []
-    for i in range(len(photo_durations)):
+    for i in range(len(media_durations)):
         if i in label_input_map:
             overlay_filters.append(f"[v{i}][{label_input_map[i]}:v]overlay=0:0[vl{i}]")
             stream_names.append(f"[vl{i}]")
@@ -794,13 +1066,28 @@ def build_render_command(
     filter_parts = [";\n".join(filters)]
     if overlay_filters:
         filter_parts.append(";\n".join(overlay_filters))
-    filter_parts.append(build_xfade_chain(photo_durations, xfade, transition, stream_names))
-    filter_complex = ";\n".join(filter_parts)
+    filter_parts.append(build_xfade_chain(media_durations, xfade, transition, stream_names))
 
+    # Audio: use filter-complex mixing when clips have audible audio (keep/duck);
+    # otherwise fall back to the simple -map + -af apad approach.
+    has_video_clips = any(info and info.is_video for info in infos_list)
+    use_complex_audio = has_video_clips and clip_audio != "mute"
+    audio_filter = ""
+    if use_complex_audio:
+        audio_filter = _build_clip_audio_filters(
+            infos_list, media_durations, xfade, audio_input_idx, clip_audio
+        )
+        if audio_filter:
+            filter_parts.append(audio_filter)
+
+    filter_complex = ";\n".join(filter_parts)
     cmd += ["-filter_complex", filter_complex, "-map", "[vout]", "-r", str(fps), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-    if audio_path is not None:
-        audio_index = len(images)
-        cmd += ["-map", f"{audio_index}:a", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+
+    if use_complex_audio and audio_filter:
+        cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    elif audio_path is not None:
+        cmd += ["-map", f"{len(images)}:a", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+
     if encoder == "h264_videotoolbox":
         cmd += ["-c:v", "h264_videotoolbox", "-b:v", bitrate]
     else:
@@ -816,8 +1103,9 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
            motion_style="none", ken_override=None, parallax_override=None, motion_seed=0,
            rhythm_strength=0.12, focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
            label_overlay_paths: Optional[List[Optional[Path]]] = None,
-           audio_path: Optional[Path] = None,
-           audio_offset: float = 0.0) -> str:
+           audio_path: Optional[Path] = None, audio_offset: float = 0.0,
+           infos: Optional[List[Optional[PhotoInfo]]] = None,
+           clip_grade: str = "full", clip_audio: str = "mute") -> str:
     """Run the render and return the encoder actually used."""
     render_kwargs = dict(
         images=images, out_path=out_path, width=width, height=height,
@@ -828,6 +1116,7 @@ def render(images, out_path: Path, width, height, fps=30, sec=2.8, xfade=0.7, tr
         rhythm_strength=rhythm_strength, focal_points=focal_points,
         label_overlay_paths=label_overlay_paths,
         audio_path=audio_path, audio_offset=audio_offset,
+        infos=infos, clip_grade=clip_grade, clip_audio=clip_audio,
     )
     cmd, duration = build_render_command(**render_kwargs)  # type: ignore[arg-type]
     try:
@@ -900,7 +1189,8 @@ def split_photos_into_parts(
 
     for img, info, fp in zip(images, infos, focal_points):
         trial = cur_imgs + [img]
-        trial_dur = build_photo_durations(len(trial), base_sec, xfade, rhythm_strength, seed)
+        trial_infos = cur_infos + [info]
+        trial_dur = build_media_durations(trial_infos, base_sec, xfade, rhythm_strength, seed)
         trial_total = estimate_duration_variable(trial_dur, xfade)
         if trial_total > max_sec and cur_imgs:
             parts.append((cur_imgs, cur_infos, cur_focal))
@@ -953,6 +1243,10 @@ def parse_args():
                     help="Per-photo timing variation strength (0.0 to 0.25)")
     ap.add_argument("--audio", default=None,
                     help="Path to an audio file to mix into the slideshow. Trimmed to video length.")
+    ap.add_argument("--clip-grade", default="full", choices=["none", "grade", "full"],
+                    help="Visual treatment for video clips: none (no effect), grade (color only), full (grade+vignette+grain)")
+    ap.add_argument("--clip-audio", default="mute", choices=["mute", "keep", "duck"],
+                    help="Clip audio handling: mute (silence clips), keep (mix with background), duck (lower background during clips)")
     ap.add_argument("--split-secs", type=float, default=None,
                     help="Also render split parts, each no longer than this many seconds")
     ap.add_argument("--fps", type=int, default=None,
@@ -1473,8 +1767,8 @@ def main():
         progress_print(args.progress, f"[phase prep] scanning {src}")
         if detect_focus:
             progress_print(args.progress, "[phase prep] initializing smart focus detectors")
-        progress_print(args.progress, f"[phase prep] found image candidates and starting {'conversion + smart focus' if detect_focus else 'conversion'}")
-        images, infos = convert_to_pngs(
+        progress_print(args.progress, f"[phase prep] collecting media ({'conversion + smart focus' if detect_focus else 'conversion'} for images, probe for video clips)")
+        images, infos = collect_media(
             src,
             temp_work,
             extract_exif=extract_exif,
@@ -1483,9 +1777,14 @@ def main():
             show_progress=args.progress,
         )
         if not images:
-            raise SystemExit(f"No supported images found in {src}. Supported: {', '.join(sorted(IMG_EXTS))}")
+            raise SystemExit(
+                f"No supported media found in {src}. "
+                f"Images: {', '.join(sorted(IMG_EXTS))}  "
+                f"Videos: {', '.join(sorted(VID_EXTS))}"
+            )
 
-        progress_print(args.progress, f"[phase prep] ordering {len(images)} prepared images with sort={args.sort_by}")
+        n_clips = sum(1 for i in infos if i and i.is_video)
+        progress_print(args.progress, f"[phase prep] ordering {len(images)} items ({n_clips} video clips) with sort={args.sort_by}")
         images, infos = sort_images_and_infos(images, infos, sort_by=args.sort_by, seed=args.seed)
         if args.camera_stats:
             print_camera_stats(infos)
@@ -1497,11 +1796,11 @@ def main():
         focal_points = [info.focal_point if info else None for info in infos]
         if detect_focus:
             focused_count = sum(1 for point in focal_points if point is not None)
-            print(f"Smart focus: detected subjects in {focused_count}/{len(focal_points)} images")
+            print(f"Smart focus: detected subjects in {focused_count}/{len(focal_points) - n_clips} photos")
 
         encoder = "h264_videotoolbox" if ffmpeg_has_encoder("h264_videotoolbox") else "libx264"
         estimated_total = estimate_duration_variable(
-            build_photo_durations(len(images), args.sec, args.xfade, args.rhythm_strength, args.seed),
+            build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed),
             args.xfade,
         )
         print(
@@ -1533,10 +1832,10 @@ def main():
 
         part_audio_offsets: List[float] = []
         cumulative = 0.0
-        for part_imgs, _, _ in part_groups:
+        for part_imgs, part_infos, _ in part_groups:
             part_audio_offsets.append(cumulative)
             cumulative += estimate_duration_variable(
-                build_photo_durations(len(part_imgs), args.sec, args.xfade, args.rhythm_strength, args.seed),
+                build_media_durations(part_infos, args.sec, args.xfade, args.rhythm_strength, args.seed),
                 args.xfade,
             )
 
@@ -1547,6 +1846,7 @@ def main():
             ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
             motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
             audio_path=audio_path,
+            clip_grade=args.clip_grade, clip_audio=args.clip_audio,
         )
 
         outputs = []
@@ -1562,6 +1862,7 @@ def main():
                 cmd, duration = build_render_command(
                     images=images, out_path=out, width=width, height=height,
                     focal_points=focal_points, label_overlay_paths=label_overlay_paths,
+                    infos=infos,
                     **render_kwargs_base,
                 )
                 print(f"[dry-run] {width}x{height} estimated_duration={duration:.1f}s")
@@ -1570,6 +1871,7 @@ def main():
                 actual_encoder = render(
                     images, out, width, height,
                     focal_points=focal_points, label_overlay_paths=label_overlay_paths,
+                    infos=infos,
                     **render_kwargs_base,
                 )
                 outputs.append(out)
@@ -1581,7 +1883,7 @@ def main():
                 progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
                 for part_idx, (part_imgs, part_infos, part_focal) in enumerate(part_groups, start=1):
                     part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
-                    progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} images -> {part_out.name}")
+                    progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} items -> {part_out.name}")
                     part_label_paths = (
                         build_label_overlay_paths_for_infos(part_infos, width, height, temp_work, f"p{part_idx}")
                         if args.location_overlay
@@ -1592,6 +1894,7 @@ def main():
                             images=part_imgs, out_path=part_out, width=width, height=height,
                             focal_points=part_focal, label_overlay_paths=part_label_paths,
                             audio_offset=part_audio_offsets[part_idx - 1],
+                            infos=part_infos,
                             **render_kwargs_base,
                         )
                         print(f"[dry-run] part {part_idx} {width}x{height} estimated_duration={duration:.1f}s")
@@ -1601,6 +1904,7 @@ def main():
                             part_imgs, part_out, width, height,
                             focal_points=part_focal, label_overlay_paths=part_label_paths,
                             audio_offset=part_audio_offsets[part_idx - 1],
+                            infos=part_infos,
                             **render_kwargs_base,
                         )
                         outputs.append(part_out)
