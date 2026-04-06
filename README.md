@@ -31,7 +31,7 @@ When video clips are present the count suffix includes both: `_n10c2` means 10 p
 video-workflow/
   input_photos/          # source photos
   Renders/               # output videos
-  .work_pngs/            # temporary work directory (--workdir); auto-cleaned after each render
+  .work_pngs/            # parent for session temp dirs (--workdir); each render creates and removes a subdir
   videophotoslide.py     # slideshow generator
 ```
 
@@ -91,7 +91,7 @@ python videophotoslide.py ./input_photos
 | Flag | Default | Description |
 |---|---|---|
 | --outdir | ./Renders | Output directory |
-| --workdir | ./.work_pngs | Working directory for temporary files (used directly; cleaned up after render) |
+| --workdir | ./.work_pngs | Parent directory for the session temp folder; only the session subdir is deleted after render |
 | --format | both | 16x9, 9x16, or both |
 | --quality | standard | draft, standard, high |
 | --sec | 2.8 | Base seconds per photo |

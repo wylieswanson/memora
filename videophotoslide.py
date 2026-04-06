@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from collections import Counter
@@ -990,19 +991,19 @@ def _build_clip_audio_filters(
     if not mix_labels:
         return ""
 
-    has_fade = audio_fade and audio_fade > 0 and total_duration > 0
+    effective_fade = min(audio_fade, total_duration) if (audio_fade and audio_fade > 0 and total_duration > 0) else None
     if len(mix_labels) == 1:
-        if has_fade:
-            fade_st = max(0.0, total_duration - audio_fade)  # type: ignore[operator]
-            parts.append(f"{mix_labels[0]}afade=t=out:st={fade_st:.3f}:d={audio_fade:.3f}[aout]")
+        if effective_fade:
+            fade_st = total_duration - effective_fade
+            parts.append(f"{mix_labels[0]}afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}[aout]")
         else:
             parts.append(f"{mix_labels[0]}anull[aout]")
     else:
         joined = "".join(mix_labels)
-        if has_fade:
-            fade_st = max(0.0, total_duration - audio_fade)  # type: ignore[operator]
+        if effective_fade:
+            fade_st = total_duration - effective_fade
             parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[amix_a]")
-            parts.append(f"[amix_a]afade=t=out:st={fade_st:.3f}:d={audio_fade:.3f}[aout]")
+            parts.append(f"[amix_a]afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}[aout]")
         else:
             parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[aout]")
 
@@ -1127,9 +1128,10 @@ def build_render_command(
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-shortest"]
     elif cfg.audio_path is not None:
         af = "apad"
-        if cfg.audio_fade and cfg.audio_fade > 0:
-            fade_st = max(0.0, duration - cfg.audio_fade)
-            af += f",afade=t=out:st={fade_st:.3f}:d={cfg.audio_fade:.3f}"
+        if cfg.audio_fade and cfg.audio_fade > 0 and duration > 0:
+            effective_fade = min(cfg.audio_fade, duration)
+            fade_st = duration - effective_fade
+            af += f",afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}"
         cmd += ["-map", f"{audio_input_idx}:a", "-af", af, "-c:a", "aac", "-b:a", "192k", "-shortest"]
 
     if cfg.encoder == "h264_videotoolbox":
@@ -1818,8 +1820,8 @@ def main():
             show_progress=args.progress,
         )
 
-    temp_work = Path(args.workdir)
-    ensure_dir(temp_work)
+    ensure_dir(Path(args.workdir))
+    temp_work = Path(tempfile.mkdtemp(prefix="videophotoslide_", dir=str(Path(args.workdir))))
 
     try:
         blur = preset["blur_strength"]

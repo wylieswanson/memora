@@ -583,6 +583,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
 
     def test_main_smoke_prints_render_settings_and_outputs(self):
         with TemporaryDirectory() as tmp:
+            session_dir = str(Path(tmp) / "videophotoslide_test")
             args = _make_args(motion_style="kenburns", seed=7, workdir=tmp)
             images = [Path("work/000000_a.png"), Path("work/000001_b.png")]
             infos = [self._info("a.png"), self._info("b.png")]
@@ -593,6 +594,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
                  patch("videophotoslide.collect_media", return_value=(images, infos)), \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
+                 patch("videophotoslide.tempfile.mkdtemp", return_value=session_dir), \
                  patch("videophotoslide.datetime") as mock_datetime, \
                  patch("videophotoslide.ensure_dir"), \
                  patch("videophotoslide.import_media_to_photos") as mock_import, \
@@ -615,7 +617,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             self.assertEqual(render_call.args[1], Path("Renders") / "render.mp4")
             self.assertEqual(render_call.args[4].transition, "fade")
             mock_import.assert_not_called()
-            mock_rmtree.assert_called_once_with(Path(tmp), ignore_errors=True)
+            mock_rmtree.assert_called_once_with(Path(session_dir), ignore_errors=True)
 
     def test_main_can_upload_to_youtube_after_render(self):
         with TemporaryDirectory() as tmp:
@@ -899,17 +901,15 @@ class VideoPhotoSlideTests(unittest.TestCase):
     # -----------------------------------------------------------------------
 
     def test_dry_run_skips_youtube_preflight(self):
-        args = _make_args(youtube_upload=True, dry_run=True)
+        with TemporaryDirectory() as tmp:
+            args = _make_args(youtube_upload=True, dry_run=True, source_dir=tmp, workdir=tmp)
 
-        with patch("videophotoslide.parse_args", return_value=args), \
-             patch("videophotoslide.ensure_dir"), \
-             patch("videophotoslide._load_youtube_credentials") as mock_creds, \
-             patch("videophotoslide.render"), \
-             patch("pathlib.Path.exists", return_value=True), \
-             patch("pathlib.Path.is_dir", return_value=True):
-            with self.assertRaises(SystemExit):
-                # Will exit on missing source_dir logic or no media, but preflight must not fire
-                vps.main()
+            with patch("videophotoslide.parse_args", return_value=args), \
+                 patch("videophotoslide.ensure_dir"), \
+                 patch("videophotoslide._load_youtube_credentials") as mock_creds:
+                with self.assertRaises(SystemExit):
+                    # Will exit when no media is found, but preflight must not fire
+                    vps.main()
 
         mock_creds.assert_not_called()
 

@@ -5,7 +5,7 @@
 **Memora: video-workflow** — a CLI tool that turns folders of photos and video clips into polished slideshow videos in 16x9 and 9x16 formats. Single script: `videophotoslide.py`. No web server, no database, no framework.
 
 Key output characteristics:
-- Deterministic, descriptive filenames: `<timestamp>_<folder>_fmt<format>_q<quality>_transition-<transition>_n<count>.mp4`
+- Deterministic, descriptive filenames: `<timestamp>_<folder>_fmt<format>_q<quality>_transition-<transition>_n<photos>[c<clips>].mp4` — `c<clips>` suffix only appears when video clips are present
 - Both aspect ratios rendered in one pass by default
 - All visual effects (filmic grade, vignette, grain, Ken Burns, parallax) composed in FFmpeg filter graphs
 - Hardware-accelerated encoding via `h264_videotoolbox` with `libx264` fallback
@@ -99,7 +99,8 @@ Photos (`.jpg`, `.heic`, etc.) and video clips (`.mp4`, `.mov`) can be mixed fre
 
 **Photos** — `build_filter_for_still()`:
 - Input via `-loop 1 -t <dur>` (still image looped for its duration)
-- Filter chain: `scale (bg fill) → boxblur → overlay (fg) → grade → vignette → grain → [optional kenburns/parallax zoompan]`
+- **No motion** (`ken_strength == 0`): `scale (bg fill, increase) → boxblur` + `scale (fg fit, decrease)` → `overlay=(W-w)/2:(H-h)/2` → grade → vignette → grain. Optional parallax animates the overlay x position.
+- **Ken Burns** (`ken_strength > 0`): same bg path as no-motion; fg uses `scale (decrease, fit) → scale (zoom, eval=frame)`; overlay x/y pan from `start_fx`/`start_fy` to `end_fx`/`end_fy` animated with ease function. Both paths always show the blurred background, preserving portrait photos in landscape output.
 
 **Clips** — `build_filter_for_clip()`:
 - Input via plain `-i` (no loop)
@@ -171,7 +172,7 @@ When adding new features:
 
 - **No external config files** — all settings are CLI args with defaults, no YAML/TOML/JSON config
 - **Path handling** — always use `pathlib.Path`, never string concatenation for paths
-- **Temp work directory** — normalized PNGs go inside a `tempfile.mkdtemp()` subtree; always cleaned up in `finally`. Video clips are never copied — they're referenced at their original path.
+- **Temp work directory** — `tempfile.mkdtemp(prefix="videophotoslide_", dir=args.workdir)` creates a session-specific subdir inside `--workdir` (default `./.work_pngs`). Only that subdir is deleted in `finally` — the workdir parent is never removed. Video clips are never copied; they're referenced at their original path.
 - **FFmpeg/ffprobe invocation** — build command as a list of strings, execute via `subprocess.run()`, never `shell=True`
 - **Encoder selection** — always check `ffmpeg_has_encoder("h264_videotoolbox")` at runtime, fall back to `libx264`
 - **Parallelism** — image conversion uses `multiprocessing.Pool`; clip probing and everything else is single-threaded
