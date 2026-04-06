@@ -998,20 +998,32 @@ def _build_clip_audio_filters(
         return ""
 
     effective_fade = min(audio_fade, total_duration) if (audio_fade and audio_fade > 0 and total_duration > 0) else None
+    final_label: Optional[str] = None
     if len(mix_labels) == 1:
         if effective_fade:
             fade_st = total_duration - effective_fade
-            parts.append(f"{mix_labels[0]}afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}[aout]")
+            parts.append(f"{mix_labels[0]}afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}[amix_a]")
+            final_label = "[amix_a]"
         else:
-            parts.append(f"{mix_labels[0]}anull[aout]")
+            final_label = mix_labels[0]
     else:
         joined = "".join(mix_labels)
         if effective_fade:
             fade_st = total_duration - effective_fade
             parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[amix_a]")
-            parts.append(f"[amix_a]afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}[aout]")
+            parts.append(f"[amix_a]afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}[amix_b]")
+            final_label = "[amix_b]"
         else:
-            parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[aout]")
+            parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[amix_a]")
+            final_label = "[amix_a]"
+
+    if final_label is None:
+        return ""
+
+    if total_duration > 0:
+        parts.append(f"{final_label}apad,atrim=duration={total_duration:.6f}[aout]")
+    else:
+        parts.append(f"{final_label}anull[aout]")
 
     return ";\n".join(parts)
 

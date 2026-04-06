@@ -938,6 +938,31 @@ class VideoPhotoSlideTests(unittest.TestCase):
         self.assertIn("d=2.000", result)
         self.assertIn("[aout]", result)
 
+    def test_build_render_command_complex_audio_without_background_pads_to_video_duration(self):
+        clip_info = vps.PhotoInfo(
+            path=Path("c.mp4"), width=1920, height=1080,
+            aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+            is_video=True, video_duration=5.0, has_audio=True,
+        )
+        photo_info = self._info("p.png")
+        cfg = vps.RenderConfig(encoder="libx264", clip_audio="keep")
+
+        cmd, _duration = vps.build_render_command(
+            images=[Path("c.mp4"), Path("p.png")],
+            out_path=Path("out.mp4"),
+            width=1920,
+            height=1080,
+            cfg=cfg,
+            focal_points=[None, None],
+            infos=[clip_info, photo_info],
+        )
+
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("apad,atrim=duration=", filter_complex)
+        self.assertIn("[aout]", filter_complex)
+        audio_map_idx = cmd.index("-map", cmd.index("-map") + 1)
+        self.assertEqual(cmd[audio_map_idx + 1], "[aout]")
+
     # -----------------------------------------------------------------------
     # dry-run skips YouTube preflight
     # -----------------------------------------------------------------------
