@@ -109,6 +109,7 @@ class PhotoInfo:
     location_name: Optional[str] = None
     is_video: bool = False
     video_duration: Optional[float] = None
+    has_audio: bool = False
 
     def __post_init__(self):
         if self.aspect_ratio > 1.1:
@@ -246,6 +247,10 @@ def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
         (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
         None,
     )
+    audio_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "audio"),
+        None,
+    )
     if video_stream is None:
         print(f"Skipping video (no video stream found): {path.name}", file=sys.stderr)
         return None
@@ -304,6 +309,7 @@ def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
         datetime_taken=datetime_taken,
         is_video=True,
         video_duration=duration,
+        has_audio=audio_stream is not None,
     )
 
 
@@ -965,7 +971,7 @@ def _build_clip_audio_filters(
     clip_items = [
         (i, start_times[i], start_times[i] + media_durations[i])
         for i, info in enumerate(infos_list)
-        if info and info.is_video
+        if info and info.is_video and info.has_audio
     ]
 
     parts: List[str] = []
@@ -1512,6 +1518,20 @@ def build_youtube_title(output_path: Path, input_dir: Path, fmt: str, custom_tit
     return f"{input_dir.name} slideshow ({fmt})"
 
 
+def infer_input_dir_for_upload(upload_only_path: Path, source_dir: Optional[str]) -> Path:
+    if source_dir:
+        return Path(source_dir)
+
+    stem = upload_only_path.stem
+    marker = "_fmt"
+    if marker in stem:
+        prefix = stem.split(marker, 1)[0]
+        parts = prefix.split("_", 1)
+        if len(parts) == 2 and parts[1]:
+            return Path(parts[1])
+    return upload_only_path.parent
+
+
 def infer_render_format(video_path: Path) -> str:
     stem = video_path.stem.lower()
     if "fmt16x9" in stem or "16x9" in stem:
@@ -1731,7 +1751,7 @@ def _run_upload_only(
     if not upload_only_path.exists() or not upload_only_path.is_file():
         raise SystemExit(f"Missing YouTube upload file: {upload_only_path}")
 
-    input_dir = Path(args.source_dir) if args.source_dir else upload_only_path.parent
+    input_dir = infer_input_dir_for_upload(upload_only_path, args.source_dir)
     if args.source_dir and (not input_dir.exists() or not input_dir.is_dir()):
         raise SystemExit(f"Missing source directory: {input_dir}")
 

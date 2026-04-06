@@ -271,6 +271,13 @@ class VideoPhotoSlideTests(unittest.TestCase):
         )
         self.assertEqual(title, "Input Photos | 1920x1080 | my-video")
 
+    def test_infer_input_dir_for_upload_uses_render_stem_when_source_dir_missing(self):
+        inferred = vps.infer_input_dir_for_upload(
+            Path("Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_qstandard_transition-auto_n12.mp4"),
+            None,
+        )
+        self.assertEqual(inferred, Path("lorena-climbing-prescott"))
+
     # -----------------------------------------------------------------------
     # macOS Photos import
     # -----------------------------------------------------------------------
@@ -501,7 +508,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
         clip_info = vps.PhotoInfo(
             path=Path("c.mp4"), width=1920, height=1080,
             aspect_ratio=1.78, is_landscape=True, orientation="landscape",
-            is_video=True, video_duration=5.0,
+            is_video=True, video_duration=5.0, has_audio=True,
         )
         # mute is handled upstream — _build_clip_audio_filters is only called for keep/duck
         result = vps._build_clip_audio_filters(
@@ -518,6 +525,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             path=Path("c.mp4"), width=1920, height=1080,
             aspect_ratio=1.78, is_landscape=True, orientation="landscape",
             is_video=True, video_duration=5.0,
+            has_audio=True,
         )
         result = vps._build_clip_audio_filters(
             infos_list=[clip_info],
@@ -529,6 +537,21 @@ class VideoPhotoSlideTests(unittest.TestCase):
         self.assertIn("volume=", result)
         self.assertIn("0.2", result)
         self.assertIn("[aout]", result)
+
+    def test_build_clip_audio_filters_skips_silent_clips(self):
+        clip_info = vps.PhotoInfo(
+            path=Path("silent.mp4"), width=1920, height=1080,
+            aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+            is_video=True, video_duration=5.0, has_audio=False,
+        )
+        result = vps._build_clip_audio_filters(
+            infos_list=[clip_info],
+            media_durations=[5.0],
+            xfade=0.7,
+            audio_input_idx=1,
+            clip_audio="keep",
+        )
+        self.assertEqual(result, "[1:a]apad[bg_a];\n[bg_a]anull[aout]")
 
     # -----------------------------------------------------------------------
     # RenderConfig
@@ -711,6 +734,25 @@ class VideoPhotoSlideTests(unittest.TestCase):
             client_secrets=Path("./client_secrets.json"),
             token_file=Path("./.youtube_token.json"),
         )
+
+    def test_main_upload_only_default_title_uses_inferred_input_dir(self):
+        args = _make_args(
+            source_dir=None,
+            youtube_upload_file="./Renders/20260322-194059_lorena-climbing-prescott_fmt16x9.mp4",
+            youtube_title=None,
+        )
+        stream = StringIO()
+
+        with patch("videophotoslide.parse_args", return_value=args), \
+             patch("videophotoslide.upload_video_to_youtube", return_value="xyz789") as mock_upload, \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.is_file", return_value=True), \
+             redirect_stdout(stream):
+            vps.main()
+
+        output = stream.getvalue()
+        self.assertIn("Uploading existing render to YouTube: lorena-climbing-prescott slideshow (16x9)", output)
+        self.assertEqual(mock_upload.call_args.kwargs["title"], "lorena-climbing-prescott slideshow (16x9)")
 
     def test_main_can_import_render_to_photos(self):
         with TemporaryDirectory() as tmp:
