@@ -44,12 +44,15 @@ def _make_args(**overrides):
         seed=0,
         rhythm_strength=0.12,
         audio=None,
+        audio_offset=0.0,
+        audio_fade=None,
         split_secs=None,
         fps=None,
         bitrate=None,
         dry_run=False,
         clip_grade="full",
         clip_audio="mute",
+        clip_max_sec=None,
         youtube_upload=False,
         youtube_upload_file=None,
         add_to_photos=False,
@@ -185,7 +188,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             photo_count=12,
         )
 
-        names = [name for name, _w, _h in targets]
+        names = [name for name, *_ in targets]
         self.assertEqual(
             names,
             [
@@ -286,7 +289,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
     # Filter graph
     # -----------------------------------------------------------------------
 
-    def test_build_filter_for_still_uses_focus_aware_crop_expression(self):
+    def test_build_filter_for_still_kenburns_uses_bg_fg_overlay(self):
         filt = vps.build_filter_for_still(
             0,
             1920,
@@ -296,14 +299,22 @@ class VideoPhotoSlideTests(unittest.TestCase):
             ken_strength=0.0015,
             focal_point=(0.25, 0.4),
         )
-
-        self.assertIn("crop=1920:1080", filt)
+        # Background: blurred fill present in Ken Burns path
         self.assertIn("force_original_aspect_ratio=increase", filt)
+        self.assertIn("boxblur", filt)
+        # Foreground: fit (decrease) with per-frame zoom
+        self.assertIn("force_original_aspect_ratio=decrease", filt)
+        self.assertIn("eval=frame", filt)
+        # Overlay with animated focal-point pan
+        self.assertIn("overlay=x=", filt)
+        self.assertIn("round(1920/2)", filt)
+        self.assertIn("round(1080/2)", filt)
+        # Ease function drives both zoom and pan
         self.assertIn("3*pow(min(max((t/2.8),0),1),2)-2*pow(min(max((t/2.8),0),1),3)", filt)
-        self.assertIn("*iw)-(ow/2)", filt)
-        self.assertIn("*ih)-(oh/2)", filt)
+        # No hard crop step on FG
+        self.assertNotIn(":x='", filt)
 
-    def test_build_filter_for_still_without_focus_keeps_overlay_path(self):
+    def test_build_filter_for_still_kenburns_without_focus_still_uses_bg_fg(self):
         filt = vps.build_filter_for_still(
             0,
             1920,
@@ -313,10 +324,13 @@ class VideoPhotoSlideTests(unittest.TestCase):
             ken_strength=0.0015,
             focal_point=None,
         )
-
+        # Without a focal point the bg+fg structure is still used
         self.assertIn("force_original_aspect_ratio=increase", filt)
-        self.assertIn("crop=1920:1080", filt)
-        self.assertNotIn("[bg0][fg0]overlay=(W-w)/2:(H-h)/2", filt)
+        self.assertIn("boxblur", filt)
+        self.assertIn("force_original_aspect_ratio=decrease", filt)
+        self.assertIn("overlay=x=", filt)
+        # Static center overlay (no Ken Burns) must NOT be present
+        self.assertNotIn("overlay=(W-w)/2:(H-h)/2", filt)
 
     def test_build_filter_for_still_without_kenburns_keeps_overlay_path(self):
         filt = vps.build_filter_for_still(
@@ -568,19 +582,17 @@ class VideoPhotoSlideTests(unittest.TestCase):
     # -----------------------------------------------------------------------
 
     def test_main_smoke_prints_render_settings_and_outputs(self):
-        args = _make_args(motion_style="kenburns", seed=7)
-        images = [Path("work/000000_a.png"), Path("work/000001_b.png")]
-        infos = [self._info("a.png"), self._info("b.png")]
-        fake_output_stat = SimpleNamespace(st_size=5 * 1024 * 1024)
-
         with TemporaryDirectory() as tmp:
-            temp_work = Path(tmp)
+            args = _make_args(motion_style="kenburns", seed=7, workdir=tmp)
+            images = [Path("work/000000_a.png"), Path("work/000001_b.png")]
+            infos = [self._info("a.png"), self._info("b.png")]
+            fake_output_stat = SimpleNamespace(st_size=5 * 1024 * 1024)
+
             stream = StringIO()
             with patch("videophotoslide.parse_args", return_value=args), \
                  patch("videophotoslide.collect_media", return_value=(images, infos)), \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.tempfile.mkdtemp", return_value=str(temp_work)), \
                  patch("videophotoslide.datetime") as mock_datetime, \
                  patch("videophotoslide.ensure_dir"), \
                  patch("videophotoslide.import_media_to_photos") as mock_import, \
@@ -594,37 +606,36 @@ class VideoPhotoSlideTests(unittest.TestCase):
                 mock_datetime.now.return_value.strftime.return_value = "20260322-120000"
                 vps.main()
 
-        output = stream.getvalue()
-        self.assertIn("Render settings: encoder=libx264, transition=fade, motion=kenburns", output)
-        self.assertIn("DONE", output)
-        mock_render.assert_called_once()
-        render_call = mock_render.call_args
-        self.assertEqual(render_call.args[0], images)
-        self.assertEqual(render_call.args[1], Path("Renders") / "render.mp4")
-        self.assertEqual(render_call.args[4].transition, "fade")
-        mock_import.assert_not_called()
-        mock_rmtree.assert_called_once_with(temp_work, ignore_errors=True)
+            output = stream.getvalue()
+            self.assertIn("Render settings: encoder=libx264, transition=fade, motion=kenburns", output)
+            self.assertIn("DONE", output)
+            mock_render.assert_called_once()
+            render_call = mock_render.call_args
+            self.assertEqual(render_call.args[0], images)
+            self.assertEqual(render_call.args[1], Path("Renders") / "render.mp4")
+            self.assertEqual(render_call.args[4].transition, "fade")
+            mock_import.assert_not_called()
+            mock_rmtree.assert_called_once_with(Path(tmp), ignore_errors=True)
 
     def test_main_can_upload_to_youtube_after_render(self):
-        args = _make_args(
-            youtube_upload=True,
-            youtube_title="{input_dir} {format}",
-            youtube_description="Description",
-            youtube_tags="travel, arizona",
-        )
-        images = [Path("work/000000_a.png")]
-        infos = [self._info("a.png")]
-        fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
-
         with TemporaryDirectory() as tmp:
-            temp_work = Path(tmp)
+            args = _make_args(
+                youtube_upload=True,
+                youtube_title="{input_dir} {format}",
+                youtube_description="Description",
+                youtube_tags="travel, arizona",
+                workdir=tmp,
+            )
+            images = [Path("work/000000_a.png")]
+            infos = [self._info("a.png")]
+            fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
+
             stream = StringIO()
             with patch("videophotoslide.parse_args", return_value=args), \
                  patch("videophotoslide.collect_media", return_value=(images, infos)), \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
-                  patch("videophotoslide._load_youtube_credentials"), \
+                 patch("videophotoslide._load_youtube_credentials"), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.tempfile.mkdtemp", return_value=str(temp_work)), \
                  patch("videophotoslide.datetime") as mock_datetime, \
                  patch("videophotoslide.ensure_dir"), \
                  patch("videophotoslide.import_media_to_photos"), \
@@ -700,19 +711,17 @@ class VideoPhotoSlideTests(unittest.TestCase):
         )
 
     def test_main_can_import_render_to_photos(self):
-        args = _make_args(add_to_photos=True)
-        images = [Path("work/000000_a.png")]
-        infos = [self._info("a.png")]
-        fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
-
         with TemporaryDirectory() as tmp:
-            temp_work = Path(tmp)
+            args = _make_args(add_to_photos=True, workdir=tmp)
+            images = [Path("work/000000_a.png")]
+            infos = [self._info("a.png")]
+            fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
+
             stream = StringIO()
             with patch("videophotoslide.parse_args", return_value=args), \
                  patch("videophotoslide.collect_media", return_value=(images, infos)), \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.tempfile.mkdtemp", return_value=str(temp_work)), \
                  patch("videophotoslide.datetime") as mock_datetime, \
                  patch("videophotoslide.ensure_dir"), \
                  patch("videophotoslide.import_media_to_photos") as mock_import, \
@@ -731,20 +740,18 @@ class VideoPhotoSlideTests(unittest.TestCase):
         mock_import.assert_called_once_with([Path("Renders") / "render.mp4"])
 
     def test_main_passes_smart_focus_flag_to_collect_and_render(self):
-        args = _make_args(motion_style="kenburns", smart_focus=True)
-        images = [Path("work/000000_a.png")]
-        infos = [self._info("a.png")]
-        infos[0].focal_point = (0.3, 0.4)
-        fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
-
         with TemporaryDirectory() as tmp:
-            temp_work = Path(tmp)
+            args = _make_args(motion_style="kenburns", smart_focus=True, workdir=tmp)
+            images = [Path("work/000000_a.png")]
+            infos = [self._info("a.png")]
+            infos[0].focal_point = (0.3, 0.4)
+            fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
+
             stream = StringIO()
             with patch("videophotoslide.parse_args", return_value=args), \
                  patch("videophotoslide.collect_media", return_value=(images, infos)) as mock_collect, \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.tempfile.mkdtemp", return_value=str(temp_work)), \
                  patch("videophotoslide.datetime") as mock_datetime, \
                  patch("videophotoslide.ensure_dir"), \
                  patch("videophotoslide.import_media_to_photos"), \
@@ -762,19 +769,17 @@ class VideoPhotoSlideTests(unittest.TestCase):
         self.assertEqual(mock_render.call_args.kwargs["focal_points"], [(0.3, 0.4)])
 
     def test_main_prints_prep_progress_when_enabled(self):
-        args = _make_args(progress=True)
-        images = [Path("work/000000_a.png")]
-        infos = [self._info("a.png")]
-        fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
-
         with TemporaryDirectory() as tmp:
-            temp_work = Path(tmp)
+            args = _make_args(progress=True, workdir=tmp)
+            images = [Path("work/000000_a.png")]
+            infos = [self._info("a.png")]
+            fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
+
             stream = StringIO()
             with patch("videophotoslide.parse_args", return_value=args), \
                  patch("videophotoslide.collect_media", return_value=(images, infos)), \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.tempfile.mkdtemp", return_value=str(temp_work)), \
                  patch("videophotoslide.datetime") as mock_datetime, \
                  patch("videophotoslide.ensure_dir"), \
                  patch("videophotoslide.import_media_to_photos"), \
@@ -791,6 +796,122 @@ class VideoPhotoSlideTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("[phase prep] scanning input_photos", output)
         self.assertIn("[phase prep] ordering 1 items (0 video clips) with sort=natural", output)
+
+    # -----------------------------------------------------------------------
+    # parse_args
+    # -----------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------
+    # build_targets — clip count suffix
+    # -----------------------------------------------------------------------
+
+    def test_build_targets_with_clips_includes_c_suffix(self):
+        targets = vps.build_targets(
+            fmt="16x9",
+            stamp="20260315-214501",
+            input_dir_name="Trip Photos",
+            quality="standard",
+            transition="fade",
+            photo_count=10,
+            clip_count=2,
+        )
+        names = [name for name, *_ in targets]
+        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_qstandard_transition-fade_n10c2.mp4"])
+
+    def test_build_targets_photo_only_omits_c_suffix(self):
+        targets = vps.build_targets(
+            fmt="16x9",
+            stamp="20260315-214501",
+            input_dir_name="Trip Photos",
+            quality="standard",
+            transition="fade",
+            photo_count=12,
+        )
+        names = [name for name, *_ in targets]
+        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_qstandard_transition-fade_n12.mp4"])
+
+    # -----------------------------------------------------------------------
+    # build_media_durations — clip_max_sec
+    # -----------------------------------------------------------------------
+
+    def test_build_media_durations_respects_clip_max_sec(self):
+        clip_info = vps.PhotoInfo(
+            path=Path("clip.mp4"), width=1920, height=1080,
+            aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+            is_video=True, video_duration=30.0,
+        )
+        durations = vps.build_media_durations(
+            [clip_info], base_sec=2.8, xfade=0.7, rhythm_strength=0.0, seed=0,
+            clip_max_sec=8.0,
+        )
+        self.assertAlmostEqual(durations[0], 8.0, places=3)
+
+    def test_build_media_durations_clip_max_sec_not_below_min(self):
+        clip_info = vps.PhotoInfo(
+            path=Path("clip.mp4"), width=1920, height=1080,
+            aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+            is_video=True, video_duration=5.0,
+        )
+        # clip_max_sec below min_clip_dur: result should still be >= min_clip_dur
+        durations = vps.build_media_durations(
+            [clip_info], base_sec=2.8, xfade=0.7, rhythm_strength=0.0, seed=0,
+            clip_max_sec=0.1,
+        )
+        self.assertGreaterEqual(durations[0], 0.7 + 0.1)
+
+    # -----------------------------------------------------------------------
+    # audio fade — simple path
+    # -----------------------------------------------------------------------
+
+    def test_audio_fade_applied_in_simple_audio_path(self):
+        images = [Path("work/000000_a.png")]
+        cfg = vps.RenderConfig(
+            encoder="libx264",
+            audio_path=Path("music.mp3"),
+            audio_fade=2.0,
+        )
+        cmd, _ = vps.build_render_command(images, Path("out.mp4"), 1920, 1080, cfg)
+        af_idx = cmd.index("-af")
+        self.assertIn("afade=t=out", cmd[af_idx + 1])
+        self.assertIn("d=2.000", cmd[af_idx + 1])
+
+    def test_audio_fade_applied_in_complex_audio_path(self):
+        clip_info = vps.PhotoInfo(
+            path=Path("c.mp4"), width=1920, height=1080,
+            aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+            is_video=True, video_duration=5.0,
+        )
+        result = vps._build_clip_audio_filters(
+            infos_list=[clip_info],
+            media_durations=[5.0],
+            xfade=0.7,
+            audio_input_idx=1,
+            clip_audio="keep",
+            audio_fade=2.0,
+            total_duration=5.0,
+        )
+        self.assertIn("afade=t=out", result)
+        self.assertIn("d=2.000", result)
+        self.assertIn("[aout]", result)
+
+    # -----------------------------------------------------------------------
+    # dry-run skips YouTube preflight
+    # -----------------------------------------------------------------------
+
+    def test_dry_run_skips_youtube_preflight(self):
+        args = _make_args(youtube_upload=True, dry_run=True)
+
+        with patch("videophotoslide.parse_args", return_value=args), \
+             patch("videophotoslide.ensure_dir"), \
+             patch("videophotoslide._load_youtube_credentials") as mock_creds, \
+             patch("videophotoslide.render"), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.is_dir", return_value=True):
+            with self.assertRaises(SystemExit):
+                # Will exit on missing source_dir logic or no media, but preflight must not fire
+                vps.main()
+
+        mock_creds.assert_not_called()
 
     # -----------------------------------------------------------------------
     # parse_args

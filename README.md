@@ -13,13 +13,15 @@ The current version is slideshow-only and focuses on high-ROI visual polish:
 
 ## What this produces
 
-From a directory of photos, the script renders one or both formats:
+From a directory of photos and/or video clips, the script renders one or both formats:
 - 1920x1080 (16x9)
 - 1080x1920 (9x16)
 
 Output naming is deterministic and includes run identity fields:
-- Renders/<timestamp>_<input-folder>_fmt16x9_q<quality>_transition-<transition>_n<count>.mp4
-- Renders/<timestamp>_<input-folder>_fmt9x16_q<quality>_transition-<transition>_n<count>.mp4
+- Renders/<timestamp>_<input-folder>_fmt16x9_q<quality>_transition-<transition>_n<photos>.mp4
+- Renders/<timestamp>_<input-folder>_fmt9x16_q<quality>_transition-<transition>_n<photos>.mp4
+
+When video clips are present the count suffix includes both: `_n10c2` means 10 photos and 2 clips.
 
 ---
 
@@ -29,7 +31,7 @@ Output naming is deterministic and includes run identity fields:
 video-workflow/
   input_photos/          # source photos
   Renders/               # output videos
-  .work_pngs/            # temporary PNG normalization area
+  .work_pngs/            # temporary work directory (--workdir); auto-cleaned after each render
   videophotoslide.py     # slideshow generator
 ```
 
@@ -89,6 +91,7 @@ python videophotoslide.py ./input_photos
 | Flag | Default | Description |
 |---|---|---|
 | --outdir | ./Renders | Output directory |
+| --workdir | ./.work_pngs | Working directory for temporary files (used directly; cleaned up after render) |
 | --format | both | 16x9, 9x16, or both |
 | --quality | standard | draft, standard, high |
 | --sec | 2.8 | Base seconds per photo |
@@ -104,6 +107,9 @@ python videophotoslide.py ./input_photos
 | --clip-grade | full | Visual treatment for video clips: none, grade (color only), full (grade+vignette+grain) |
 | --clip-audio | mute | Clip audio handling: mute (silence), keep (mix with background), duck (lower background during clips) |
 | --audio | none | Path to background audio file to mix into the slideshow |
+| --audio-offset | 0.0 | Skip N seconds into the background audio before mixing (e.g. skip to the drop) |
+| --audio-fade | off | Fade out the background audio over N seconds at the end |
+| --clip-max-sec | off | Trim video clips to at most N seconds |
 | --youtube-upload | off | Upload each rendered output to YouTube after rendering |
 | --youtube-upload-file | off | Upload an existing rendered `.mp4` to YouTube without re-rendering |
 | --add-to-photos | off | Import rendered `.mp4` files into the macOS Photos app |
@@ -198,6 +204,12 @@ Smart focus:
 - `--smart-focus` is a clean v1 subject-targeting mode for Ken Burns.
 - It uses MediaPipe face detection first, pose fallback second, and otherwise falls back to center framing.
 - It currently activates when `--motion-style` is `kenburns` or `both`.
+
+Sort modes:
+- `natural` (default): filename order.
+- `time`: EXIF datetime, with undated items appended at the end.
+- `random`: seeded shuffle (use `--seed` for reproducibility).
+- `location`: sorts by raw GPS latitude then longitude — not geographic clustering. Photos from the same area but different latitudes may interleave unexpectedly. Future: proximity-based clustering.
 
 ---
 

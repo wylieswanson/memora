@@ -12,7 +12,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from collections import Counter
@@ -24,7 +23,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".heic", ".heif"}
 VID_EXTS = {".mp4", ".mov"}
@@ -139,8 +138,10 @@ class RenderConfig:
     rhythm_strength: float = 0.12
     audio_path: Optional[Path] = None
     audio_offset: float = 0.0
+    audio_fade: Optional[float] = None
     clip_grade: str = "full"
     clip_audio: str = "mute"
+    clip_max_sec: Optional[float] = None
 
 
 def natural_key(s: str):
@@ -236,7 +237,8 @@ def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         data = json.loads(result.stdout)
-    except Exception:
+    except Exception as e:
+        print(f"Skipping video (probe failed): {path.name} — {e}", file=sys.stderr)
         return None
 
     video_stream = next(
@@ -244,21 +246,26 @@ def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
         None,
     )
     if video_stream is None:
+        print(f"Skipping video (no video stream found): {path.name}", file=sys.stderr)
         return None
 
     width = int(video_stream.get("width", 0))
     height = int(video_stream.get("height", 0))
     if width <= 0 or height <= 0:
+        print(f"Skipping video (invalid dimensions {width}x{height}): {path.name}", file=sys.stderr)
         return None
 
     raw_dur = video_stream.get("duration") or data.get("format", {}).get("duration")
     if not raw_dur:
+        print(f"Skipping video (no duration in metadata): {path.name}", file=sys.stderr)
         return None
     try:
         duration = float(raw_dur)
     except ValueError:
+        print(f"Skipping video (unreadable duration {raw_dur!r}): {path.name}", file=sys.stderr)
         return None
     if duration <= 0:
+        print(f"Skipping video (zero or negative duration {duration}s): {path.name}", file=sys.stderr)
         return None
 
     ar = width / height
@@ -390,6 +397,7 @@ def build_media_durations(
     xfade: float,
     rhythm_strength: float,
     seed: int,
+    clip_max_sec: Optional[float] = None,
 ) -> List[float]:
     """Per-item durations: video clips use natural duration; photos use rhythm-varied base_sec.
 
@@ -397,15 +405,20 @@ def build_media_durations(
     so photo indices shift when clips are interleaved. This is intentional: the
     wave is used only for photo slots and clip slots are overwritten with their
     natural duration, so the resulting pacing is still musically coherent.
+    clip_max_sec caps clip durations when set.
     """
     photo_durations = build_photo_durations(len(infos), base_sec, xfade, rhythm_strength, seed)
     min_clip_dur = max(xfade + 0.1, 0.5)
-    return [
-        max(info.video_duration, min_clip_dur)
-        if (info and info.is_video and info.video_duration is not None)
-        else dur
-        for dur, info in zip(photo_durations, infos)
-    ]
+    result = []
+    for dur, info in zip(photo_durations, infos):
+        if info and info.is_video and info.video_duration is not None:
+            clip_dur = max(info.video_duration, min_clip_dur)
+            if clip_max_sec is not None:
+                clip_dur = min(clip_dur, max(clip_max_sec, min_clip_dur))
+            result.append(clip_dur)
+        else:
+            result.append(dur)
+    return result
 
 
 def resolve_transition_name(transition_mode: str, index: int) -> str:
@@ -681,9 +694,7 @@ def collect_media(
     for vf in vid_files:
         progress_print(show_progress, f"[prep probe] {vf.name}")
         vinfo = probe_video_clip(vf)
-        if vinfo is None:
-            print(f"Skipping video (probe failed): {vf.name}", file=sys.stderr)
-        else:
+        if vinfo is not None:
             vid_file_result[vf] = (vf, vinfo)
 
     # Merge in original natural sort order.
@@ -716,8 +727,6 @@ def create_label_overlay_png(
     - Bottom-right: location lines, right-justified, auto-scaled to fit margin.
     - Top-right:    altitude, smaller text, right-justified.
     """
-    from PIL import ImageDraw, ImageFont
-
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -820,26 +829,32 @@ def build_filter_for_still(
         start_fy = clamp(focus_y - (drift_norm_y * 0.5), 0.18, 0.82)
         end_fy = clamp(focus_y + (drift_norm_y * 0.5), 0.18, 0.82)
 
+        # Background: blurred fill, same as the no-motion path — ensures portrait photos
+        # in landscape output (and any other aspect mismatch) always have a blurred backdrop.
+        bg = (
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+            f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
+            f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
+        )
+        # Foreground: fit to frame (decrease), then animate the Ken Burns zoom per-frame.
         fg = (
-            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,setsar=1,"
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,"
             f"scale=w='iw*({base_zoom}+(({end_zoom}-{base_zoom})*{ease}))':"
             f"h='ih*({base_zoom}+(({end_zoom}-{base_zoom})*{ease}))':eval=frame,"
             f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
         )
-        start_x = f"min(max(({start_fx}*iw)-(ow/2),0),max(iw-ow,0))"
-        end_x = f"min(max(({end_fx}*iw)-(ow/2),0),max(iw-ow,0))"
-        start_y = f"min(max(({start_fy}*ih)-(oh/2),0),max(ih-oh,0))"
-        end_y = f"min(max(({end_fy}*ih)-(oh/2),0),max(ih-oh,0))"
-        crop_x = f"({start_x})+(({end_x})-({start_x}))*{ease}"
-        crop_y = f"({start_y})+(({end_y})-({start_y}))*{ease}"
+        # Overlay: pan from start to end focal position via ease.
+        # w/h in the overlay expression are the current-frame FG dimensions (varies with zoom).
+        pan_x = f"round({width}/2)-(({start_fx}+({end_fx}-{start_fx})*{ease})*w)"
+        pan_y = f"round({height}/2)-(({start_fy}+({end_fy}-{start_fy})*{ease})*h)"
         comp = (
-            f"[fg{i}]crop={width}:{height}:x='{crop_x}':y='{crop_y}',"
+            f"[bg{i}][fg{i}]overlay=x='{pan_x}':y='{pan_y}',"
             "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
             "vignette=PI/10,"
             "noise=alls=3:allf=t+u,"
             f"format=yuv420p[v{i}]"
         )
-        return ";\n".join([fg, comp])
+        return ";\n".join([bg, fg, comp])
 
     bg = (
         f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
@@ -935,12 +950,15 @@ def _build_clip_audio_filters(
     xfade: float,
     audio_input_idx: Optional[int],
     clip_audio: str,
+    audio_fade: Optional[float] = None,
+    total_duration: float = 0.0,
 ) -> str:
     """Build audio filter complex fragment for keep/duck modes. Returns fragment producing [aout].
 
     audio_input_idx: ffmpeg input index of the background --audio file, or None if not provided.
     clip_audio: "keep" (mix clip audio with background at full volume) or
                 "duck" (lower background to 20% during clip playback).
+    audio_fade: if set, fade out the final mix over this many seconds at the end.
     """
     start_times = _media_start_times(media_durations, xfade)
     clip_items = [
@@ -972,11 +990,21 @@ def _build_clip_audio_filters(
     if not mix_labels:
         return ""
 
+    has_fade = audio_fade and audio_fade > 0 and total_duration > 0
     if len(mix_labels) == 1:
-        parts.append(f"{mix_labels[0]}anull[aout]")
+        if has_fade:
+            fade_st = max(0.0, total_duration - audio_fade)  # type: ignore[operator]
+            parts.append(f"{mix_labels[0]}afade=t=out:st={fade_st:.3f}:d={audio_fade:.3f}[aout]")
+        else:
+            parts.append(f"{mix_labels[0]}anull[aout]")
     else:
         joined = "".join(mix_labels)
-        parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[aout]")
+        if has_fade:
+            fade_st = max(0.0, total_duration - audio_fade)  # type: ignore[operator]
+            parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[amix_a]")
+            parts.append(f"[amix_a]afade=t=out:st={fade_st:.3f}:d={audio_fade:.3f}[aout]")
+        else:
+            parts.append(f"{joined}amix=inputs={len(mix_labels)}:normalize=0[aout]")
 
     return ";\n".join(parts)
 
@@ -1020,7 +1048,7 @@ def build_render_command(
     infos: Optional[List[Optional[PhotoInfo]]] = None,
 ) -> Tuple[List[str], float]:
     infos_list: List[Optional[PhotoInfo]] = infos if infos is not None else [None] * len(images)
-    media_durations = build_media_durations(infos_list, cfg.sec, cfg.xfade, cfg.rhythm_strength, cfg.motion_seed)
+    media_durations = build_media_durations(infos_list, cfg.sec, cfg.xfade, cfg.rhythm_strength, cfg.motion_seed, cfg.clip_max_sec)
     duration = estimate_duration_variable(media_durations, cfg.xfade)
     ken, para = resolve_motion_values(cfg.motion_style, cfg.ken_override, cfg.parallax_override, min(width, height), cfg.sec)
 
@@ -1086,7 +1114,8 @@ def build_render_command(
     audio_filter = ""
     if use_complex_audio:
         audio_filter = _build_clip_audio_filters(
-            infos_list, media_durations, cfg.xfade, audio_input_idx, cfg.clip_audio
+            infos_list, media_durations, cfg.xfade, audio_input_idx, cfg.clip_audio,
+            audio_fade=cfg.audio_fade, total_duration=duration,
         )
         if audio_filter:
             filter_parts.append(audio_filter)
@@ -1097,7 +1126,11 @@ def build_render_command(
     if use_complex_audio and audio_filter:
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-shortest"]
     elif cfg.audio_path is not None:
-        cmd += ["-map", f"{len(images)}:a", "-af", "apad", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        af = "apad"
+        if cfg.audio_fade and cfg.audio_fade > 0:
+            fade_st = max(0.0, duration - cfg.audio_fade)
+            af += f",afade=t=out:st={fade_st:.3f}:d={cfg.audio_fade:.3f}"
+        cmd += ["-map", f"{audio_input_idx}:a", "-af", af, "-c:a", "aac", "-b:a", "192k", "-shortest"]
 
     if cfg.encoder == "h264_videotoolbox":
         cmd += ["-c:v", "h264_videotoolbox", "-b:v", cfg.bitrate]
@@ -1182,6 +1215,7 @@ def split_photos_into_parts(
     rhythm_strength: float,
     seed: int,
     max_sec: float,
+    clip_max_sec: Optional[float] = None,
 ) -> List[Tuple[List[Path], List[Optional[PhotoInfo]], List[Optional[Tuple[float, float]]]]]:
     """Greedily group photos into parts whose estimated duration does not exceed max_sec."""
     parts = []
@@ -1192,13 +1226,13 @@ def split_photos_into_parts(
     for img, info, fp in zip(images, infos, focal_points):
         trial = cur_imgs + [img]
         trial_infos = cur_infos + [info]
-        trial_dur = build_media_durations(trial_infos, base_sec, xfade, rhythm_strength, seed)
+        trial_dur = build_media_durations(trial_infos, base_sec, xfade, rhythm_strength, seed, clip_max_sec)
         trial_total = estimate_duration_variable(trial_dur, xfade)
         if trial_total > max_sec and cur_imgs:
             parts.append((cur_imgs, cur_infos, cur_focal))
             cur_imgs, cur_infos, cur_focal = [img], [info], [fp]
         else:
-            cur_imgs, cur_infos, cur_focal = trial, cur_infos + [info], cur_focal + [fp]
+            cur_imgs, cur_infos, cur_focal = trial, trial_infos, cur_focal + [fp]
 
     if cur_imgs:
         parts.append((cur_imgs, cur_infos, cur_focal))
@@ -1245,6 +1279,12 @@ def parse_args():
                     help="Per-photo timing variation strength (0.0 to 0.25)")
     ap.add_argument("--audio", default=None,
                     help="Path to an audio file to mix into the slideshow. Trimmed to video length.")
+    ap.add_argument("--audio-offset", type=float, default=0.0,
+                    help="Start the background audio at this offset in seconds (e.g. skip to the drop)")
+    ap.add_argument("--audio-fade", type=float, default=None,
+                    help="Fade out the background audio over this many seconds at the end of the video")
+    ap.add_argument("--clip-max-sec", type=float, default=None,
+                    help="Maximum duration in seconds for video clips (longer clips are trimmed to this length)")
     ap.add_argument("--clip-grade", default="full", choices=["none", "grade", "full"],
                     help="Visual treatment for video clips: none (no effect), grade (color only), full (grade+vignette+grain)")
     ap.add_argument("--clip-audio", default="mute", choices=["mute", "keep", "duck"],
@@ -1288,20 +1328,20 @@ def _slug(value: str) -> str:
     return token or "unnamed"
 
 
-def build_targets(fmt: str, stamp: str, input_dir_name: str, quality: str, transition: str, photo_count: int):
-    """Build render targets using the agreed deterministic filename schema."""
-    base = (
-        f"{stamp}_{_slug(input_dir_name)}"
-        f"_fmt{{fmt}}"
-        f"_q{_slug(quality)}"
-        f"_transition-{_slug(transition)}"
-        f"_n{photo_count}"
-    )
+def build_targets(fmt: str, stamp: str, input_dir_name: str, quality: str, transition: str, photo_count: int, clip_count: int = 0):
+    """Build render targets using the agreed deterministic filename schema.
+
+    Count suffix: n{photo_count} for photo-only renders; n{photo_count}c{clip_count} when clips are present.
+    """
+    count_str = f"n{photo_count}c{clip_count}" if clip_count > 0 else f"n{photo_count}"
+    slug = _slug(input_dir_name)
+    q = _slug(quality)
+    tr = _slug(transition)
     targets = []
     if fmt in ("16x9", "both"):
-        targets.append((base.format(fmt="16x9") + ".mp4", 1920, 1080))
+        targets.append((f"{stamp}_{slug}_fmt16x9_q{q}_transition-{tr}_{count_str}.mp4", 1920, 1080))
     if fmt in ("9x16", "both"):
-        targets.append((base.format(fmt="9x16") + ".mp4", 1080, 1920))
+        targets.append((f"{stamp}_{slug}_fmt9x16_q{q}_transition-{tr}_{count_str}.mp4", 1080, 1920))
     return targets
 
 
@@ -1658,6 +1698,12 @@ def _validate_args(args) -> None:
         print(f"Warning: --split-secs ({args.split_secs}s) is less than --sec ({args.sec}s); every photo will be its own part", file=sys.stderr)
     if args.audio and not Path(args.audio).is_file():
         raise SystemExit(f"--audio file not found: {args.audio}")
+    if args.audio_offset < 0:
+        raise SystemExit("--audio-offset must be >= 0")
+    if args.audio_fade is not None and args.audio_fade <= 0:
+        raise SystemExit("--audio-fade must be > 0")
+    if args.clip_max_sec is not None and args.clip_max_sec <= 0:
+        raise SystemExit("--clip-max-sec must be > 0")
     if args.fps is not None and args.fps < 12:
         raise SystemExit("--fps must be at least 12")
     if args.bitrate is not None and not re.match(r'^\d+[kKmMgG]?$', args.bitrate):
@@ -1765,16 +1811,15 @@ def main():
     if not src.exists() or not src.is_dir():
         raise SystemExit(f"Missing source directory: {src}")
 
-    if args.youtube_upload:
+    if args.youtube_upload and not args.dry_run:
         _preflight_youtube_upload(
             client_secrets=youtube_client_secrets,
             token_file=youtube_token_file,
             show_progress=args.progress,
         )
 
-    parent = Path(args.workdir).parent if Path(args.workdir).parent != Path("") else Path(".")
-    ensure_dir(parent)
-    temp_work = Path(tempfile.mkdtemp(prefix="videophotoslide_", dir=str(parent)))
+    temp_work = Path(args.workdir)
+    ensure_dir(temp_work)
 
     try:
         blur = preset["blur_strength"]
@@ -1821,7 +1866,7 @@ def main():
 
         encoder = "h264_videotoolbox" if ffmpeg_has_encoder("h264_videotoolbox") else "libx264"
         estimated_total = estimate_duration_variable(
-            build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed),
+            build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
             args.xfade,
         )
         print(
@@ -1830,13 +1875,15 @@ def main():
             f"estimated_duration={estimated_total:.1f}s"
         )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        n_photos = len(images) - n_clips
         targets = build_targets(
             args.format,
             stamp,
             src.name,
             args.quality,
             args.transition,
-            len(images),
+            n_photos,
+            n_clips,
         )
 
         if args.split_secs is not None:
@@ -1844,6 +1891,7 @@ def main():
                 images, infos, focal_points,
                 args.sec, args.xfade, args.rhythm_strength, args.seed,
                 args.split_secs,
+                clip_max_sec=args.clip_max_sec,
             )
             if len(part_groups) <= 1:
                 progress_print(args.progress, "[phase split] skipped: content fits in a single part")
@@ -1856,7 +1904,7 @@ def main():
         for part_imgs, part_infos, _ in part_groups:
             part_audio_offsets.append(cumulative)
             cumulative += estimate_duration_variable(
-                build_media_durations(part_infos, args.sec, args.xfade, args.rhythm_strength, args.seed),
+                build_media_durations(part_infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
                 args.xfade,
             )
 
@@ -1867,7 +1915,10 @@ def main():
             ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
             motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
             audio_path=audio_path,
+            audio_offset=args.audio_offset,
+            audio_fade=args.audio_fade,
             clip_grade=args.clip_grade, clip_audio=args.clip_audio,
+            clip_max_sec=args.clip_max_sec,
         )
 
         outputs = []
@@ -1908,7 +1959,7 @@ def main():
                         if args.location_overlay
                         else None
                     )
-                    part_cfg = dataclass_replace(base_cfg, audio_offset=part_audio_offsets[part_idx - 1])
+                    part_cfg = dataclass_replace(base_cfg, audio_offset=args.audio_offset + part_audio_offsets[part_idx - 1])
                     if args.dry_run:
                         cmd, duration = build_render_command(
                             part_imgs, part_out, width, height, part_cfg,
