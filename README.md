@@ -209,7 +209,7 @@ Sort modes:
 - `natural` (default): filename order.
 - `time`: EXIF datetime, with undated items appended at the end.
 - `random`: seeded shuffle (use `--seed` for reproducibility).
-- `location`: sorts by raw GPS latitude then longitude — not geographic clustering. Photos from the same area but different latitudes may interleave unexpectedly. Future: proximity-based clustering.
+- `location`: greedy nearest-neighbor sort by GPS proximity (haversine). Keeps photos from the same area together. Photos without GPS are appended at the end.
 
 ---
 

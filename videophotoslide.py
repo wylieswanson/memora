@@ -1192,6 +1192,36 @@ def render(
         return "libx264"
 
 
+def _haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Great-circle distance in km between two (lat, lon) points."""
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+
+def _nearest_neighbor_sort(
+    pairs: List[Tuple[Path, "PhotoInfo"]],
+) -> List[Tuple[Path, "PhotoInfo"]]:
+    """Greedy nearest-neighbor sort by GPS proximity (haversine).
+
+    Starts from the first item in the list and always appends the closest
+    unvisited item next. O(n²), suitable for slideshow-sized collections.
+    """
+    remaining = list(pairs)
+    ordered = [remaining.pop(0)]
+    while remaining:
+        last_gps = ordered[-1][1].gps_coords  # type: ignore[union-attr]
+        closest_idx = min(
+            range(len(remaining)),
+            key=lambda i: _haversine_km(last_gps, remaining[i][1].gps_coords),  # type: ignore[arg-type]
+        )
+        ordered.append(remaining.pop(closest_idx))
+    return ordered
+
+
 def sort_images_and_infos(
     images: List[Path],
     infos: List[Optional[PhotoInfo]],
@@ -1220,8 +1250,7 @@ def sort_images_and_infos(
         no_gps = [(image, info) for image, info in paired if not info or not info.gps_coords]
         if not with_gps:
             return images, infos
-        with_gps.sort(key=lambda item: item[1].gps_coords or (float("inf"), float("inf")))
-        ordered = with_gps + no_gps
+        ordered = _nearest_neighbor_sort(with_gps) + no_gps
         return [image for image, _info in ordered], [info for _image, info in ordered]
     raise ValueError(f"Unknown sort mode: {sort_by}")
 

@@ -115,7 +115,10 @@ class VideoPhotoSlideTests(unittest.TestCase):
         self.assertEqual(len(out_images), len(images))
         self.assertEqual(out_images, [Path("c.png"), Path("a.png"), Path("b.png"), Path("d.png")])
 
-    def test_location_sort_keeps_all_images_and_orders_geotagged_first(self):
+    def test_location_sort_uses_nearest_neighbor_proximity(self):
+        # a=(37,-122), c=(35,-120): ~277 km apart
+        # Nearest-neighbor starts at a (first GPS item in natural order),
+        # then picks c (only other GPS item), then appends no-GPS items.
         images = [Path("a.png"), Path("b.png"), Path("c.png"), Path("d.png")]
         infos = [
             self._info("a.png", gps=(37.0, -122.0)),
@@ -127,7 +130,22 @@ class VideoPhotoSlideTests(unittest.TestCase):
         out_images, _ = vps.sort_images_and_infos(images, infos, sort_by="location")
 
         self.assertEqual(len(out_images), len(images))
-        self.assertEqual(out_images, [Path("c.png"), Path("a.png"), Path("b.png"), Path("d.png")])
+        self.assertEqual(out_images, [Path("a.png"), Path("c.png"), Path("b.png"), Path("d.png")])
+
+    def test_location_sort_clusters_nearby_photos(self):
+        # Two clusters: SF area (37,-122 and 37.5,-122.5) and LA area (34,-118 and 33.9,-118.1)
+        # Starting from sf1, nearest-neighbor should visit sf2 before jumping to LA.
+        images = [Path("sf1.png"), Path("la1.png"), Path("sf2.png"), Path("la2.png")]
+        infos: list[vps.PhotoInfo | None] = [
+            self._info("sf1.png", gps=(37.0, -122.0)),
+            self._info("la1.png", gps=(34.0, -118.0)),
+            self._info("sf2.png", gps=(37.5, -122.5)),
+            self._info("la2.png", gps=(33.9, -118.1)),
+        ]
+
+        out_images, _ = vps.sort_images_and_infos(images, infos, sort_by="location")
+
+        self.assertEqual(out_images, [Path("sf1.png"), Path("sf2.png"), Path("la1.png"), Path("la2.png")])
 
     def test_random_sort_does_not_mutate_input_list(self):
         images = [Path("1.png"), Path("2.png"), Path("3.png"), Path("4.png")]
