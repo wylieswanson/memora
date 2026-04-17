@@ -13,13 +13,19 @@ The current version is slideshow-only and focuses on high-ROI visual polish:
 
 ## What this produces
 
-From a directory of photos and/or video clips, the script renders one or both formats:
-- 1920x1080 (16x9)
-- 1080x1920 (9x16)
+From a directory of photos and/or video clips, the script renders one or both aspect ratios:
+- 16x9 landscape
+- 9x16 vertical
+
+Available resolution presets:
+- `1080p`: 1920x1080 or 1080x1920
+- `1440p`: 2560x1440 or 1440x2560
+- `4k` / `2160p`: 3840x2160 or 2160x3840
+- `8k` / `4320p`: 7680x4320 or 4320x7680
 
 Output naming is deterministic and includes run identity fields:
-- Renders/<timestamp>_<input-folder>_fmt16x9_q<quality>_transition-<transition>_n<photos>.mp4
-- Renders/<timestamp>_<input-folder>_fmt9x16_q<quality>_transition-<transition>_n<photos>.mp4
+- Renders/<timestamp>_<input-folder>_fmt16x9_res<resolution>_q<quality>_transition-<transition>_n<photos>.mp4
+- Renders/<timestamp>_<input-folder>_fmt9x16_res<resolution>_q<quality>_transition-<transition>_n<photos>.mp4
 
 When video clips are present the count suffix includes both: `_n10c2` means 10 photos and 2 clips.
 
@@ -93,7 +99,8 @@ python videophotoslide.py ./input_photos
 | --outdir | ./Renders | Output directory |
 | --workdir | ./.work_pngs | Parent directory for the session temp folder; only the session subdir is deleted after render |
 | --format | both | 16x9, 9x16, or both |
-| --quality | standard | draft, standard, high |
+| --resolution | 1080p | 1080p, 1440p, 4k/2160p, or 8k/4320p |
+| --quality | standard | draft, standard, high, youtube, max |
 | --sec | 2.8 | Base seconds per photo |
 | --xfade | 0.7 | Crossfade duration |
 | --transition | auto | Transition mode or explicit ffmpeg xfade transition |
@@ -136,6 +143,12 @@ python videophotoslide.py ./input_photos --transition auto --rhythm-strength 0.1
 # Vertical-only output
 python videophotoslide.py ./input_photos --format 9x16
 
+# Practical maximum-quality YouTube render
+python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+
+# Absolute max preset; expect long renders and very large files
+python videophotoslide.py ./input_photos --format 16x9 --resolution 8k --quality max
+
 # Ken Burns with subject-aware framing
 python videophotoslide.py ./input_photos --motion-style kenburns --smart-focus
 
@@ -149,7 +162,7 @@ python videophotoslide.py ./input_photos \
 
 # Upload an existing render without re-rendering
 python videophotoslide.py \
-  --youtube-upload-file ./Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_qstandard_transition-auto_n12.mp4 \
+  --youtube-upload-file ./Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_res1080p_qstandard_transition-auto_n12.mp4 \
   --youtube-title "{filename}" \
   --youtube-description "Fresh slideshow render" \
   --youtube-tags "travel,arizona,slideshow"

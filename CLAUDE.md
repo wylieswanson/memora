@@ -5,8 +5,9 @@
 **Memora: video-workflow** — a CLI tool that turns folders of photos and video clips into polished slideshow videos in 16x9 and 9x16 formats. Single script: `videophotoslide.py`. No web server, no database, no framework.
 
 Key output characteristics:
-- Deterministic, descriptive filenames: `<timestamp>_<folder>_fmt<format>_q<quality>_transition-<transition>_n<photos>[c<clips>].mp4` — `c<clips>` suffix only appears when video clips are present
+- Deterministic, descriptive filenames: `<timestamp>_<folder>_fmt<format>_res<resolution>_q<quality>_transition-<transition>_n<photos>[c<clips>].mp4` — `c<clips>` suffix only appears when video clips are present
 - Both aspect ratios rendered in one pass by default
+- Resolution presets cover 1080p, 1440p, 4K/2160p, and experimental 8K/4320p
 - All visual effects (filmic grade, vignette, grain, Ken Burns, parallax) composed in FFmpeg filter graphs
 - Hardware-accelerated encoding via `h264_videotoolbox` with `libx264` fallback
 
@@ -47,6 +48,15 @@ QUALITY_PRESETS = {
     "draft":    {"fps": 24, "blur_strength": 12, "bitrate": "8M"},
     "standard": {"fps": 30, "blur_strength": 18, "bitrate": "15M"},
     "high":     {"fps": 30, "blur_strength": 22, "bitrate": "25M"},
+    "youtube":  {"fps": 30, "blur_strength": 22, "bitrate": "youtube"},
+    "max":      {"fps": 30, "blur_strength": 22, "bitrate": "max"},
+}
+
+RESOLUTION_PRESETS = {
+    "1080p": {"16x9": (1920, 1080), "9x16": (1080, 1920)},
+    "1440p": {"16x9": (2560, 1440), "9x16": (1440, 2560)},
+    "4k": {"16x9": (3840, 2160), "9x16": (2160, 3840)},
+    "8k": {"16x9": (7680, 4320), "9x16": (4320, 7680)},
 }
 
 MOTION_PRESETS = {
@@ -139,6 +149,9 @@ python videophotoslide.py "Photos/Videotest" --format 9x16 --clip-audio duck --a
 
 # Vertical only, with Ken Burns and smart subject framing on photos
 python videophotoslide.py ./input_photos --format 9x16 --motion-style kenburns --smart-focus
+
+# Practical maximum-quality YouTube render
+python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
 
 # Render and upload to YouTube
 python videophotoslide.py ./input_photos --format 16x9 --youtube-upload --youtube-privacy private

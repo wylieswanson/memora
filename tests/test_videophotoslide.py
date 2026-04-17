@@ -27,6 +27,7 @@ def _make_args(**overrides):
         workdir="./.work_pngs",
         quality="standard",
         format="16x9",
+        resolution="1080p",
         sort_by="natural",
         max_workers=0,
         camera_stats=False,
@@ -210,10 +211,39 @@ class VideoPhotoSlideTests(unittest.TestCase):
         self.assertEqual(
             names,
             [
-                "20260315-214501_input-photos_fmt16x9_qstandard_transition-fade_n12.mp4",
-                "20260315-214501_input-photos_fmt9x16_qstandard_transition-fade_n12.mp4",
+                "20260315-214501_input-photos_fmt16x9_res1080p_qstandard_transition-fade_n12.mp4",
+                "20260315-214501_input-photos_fmt9x16_res1080p_qstandard_transition-fade_n12.mp4",
             ],
         )
+
+    def test_build_targets_supports_4k_resolution(self):
+        targets = vps.build_targets(
+            fmt="both",
+            stamp="20260315-214501",
+            input_dir_name="Input Photos",
+            quality="youtube",
+            transition="fade",
+            photo_count=12,
+            resolution="4k",
+        )
+
+        self.assertEqual(
+            targets,
+            [
+                ("20260315-214501_input-photos_fmt16x9_res4k_qyoutube_transition-fade_n12.mp4", 3840, 2160),
+                ("20260315-214501_input-photos_fmt9x16_res4k_qyoutube_transition-fade_n12.mp4", 2160, 3840),
+            ],
+        )
+
+    def test_resolution_aliases_normalize_to_canonical_names(self):
+        self.assertEqual(vps.normalize_resolution("2160p"), "4k")
+        self.assertEqual(vps.normalize_resolution("4320p"), "8k")
+
+    def test_youtube_bitrate_scales_by_resolution_and_fps(self):
+        self.assertEqual(vps.resolve_output_bitrate("youtube", "4k", 30), "45M")
+        self.assertEqual(vps.resolve_output_bitrate("youtube", "4k", 60), "68M")
+        self.assertEqual(vps.resolve_output_bitrate("max", "8k", 30), "240M")
+        self.assertEqual(vps.resolve_output_bitrate("high", "4k", 30), "25M")
 
     # -----------------------------------------------------------------------
     # Transitions
@@ -291,7 +321,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
 
     def test_infer_input_dir_for_upload_uses_render_stem_when_source_dir_missing(self):
         inferred = vps.infer_input_dir_for_upload(
-            Path("Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_qstandard_transition-auto_n12.mp4"),
+            Path("Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_res1080p_qstandard_transition-auto_n12.mp4"),
             None,
         )
         self.assertEqual(inferred, Path("lorena-climbing-prescott"))
@@ -650,7 +680,11 @@ class VideoPhotoSlideTests(unittest.TestCase):
                 vps.main()
 
             output = stream.getvalue()
-            self.assertIn("Render settings: encoder=libx264, transition=fade, motion=kenburns", output)
+            self.assertIn(
+                "Render settings: encoder=libx264, resolution=1080p, quality=standard, "
+                "fps=30, bitrate=15M, transition=fade, motion=kenburns",
+                output,
+            )
             self.assertIn("DONE", output)
             mock_render.assert_called_once()
             render_call = mock_render.call_args
@@ -878,7 +912,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             clip_count=2,
         )
         names = [name for name, *_ in targets]
-        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_qstandard_transition-fade_n10c2.mp4"])
+        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_res1080p_qstandard_transition-fade_n10c2.mp4"])
 
     def test_build_targets_photo_only_omits_c_suffix(self):
         targets = vps.build_targets(
@@ -890,7 +924,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             photo_count=12,
         )
         names = [name for name, *_ in targets]
-        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_qstandard_transition-fade_n12.mp4"])
+        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_res1080p_qstandard_transition-fade_n12.mp4"])
 
     # -----------------------------------------------------------------------
     # build_media_durations — clip_max_sec
@@ -1006,7 +1040,15 @@ class VideoPhotoSlideTests(unittest.TestCase):
         with patch("sys.argv", ["videophotoslide.py", "./input_photos"]):
             args = vps.parse_args()
         self.assertEqual(args.outdir, "./Renders")
+        self.assertEqual(args.resolution, "1080p")
         self.assertFalse(args.progress)
+
+    def test_parse_args_accepts_resolution_alias_and_youtube_quality(self):
+        with patch("sys.argv", ["videophotoslide.py", "./input_photos",
+                                "--resolution", "2160p", "--quality", "youtube"]):
+            args = vps.parse_args()
+        self.assertEqual(args.resolution, "4k")
+        self.assertEqual(args.quality, "youtube")
 
     def test_parse_args_allows_upload_only_mode_without_source_dir(self):
         with patch("sys.argv", ["videophotoslide.py", "--youtube-upload-file", "./Renders/render.mp4"]):

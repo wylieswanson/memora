@@ -33,6 +33,29 @@ QUALITY_PRESETS = {
     "draft": {"fps": 24, "blur_strength": 12, "bitrate": "8M", "description": "Fast preview"},
     "standard": {"fps": 30, "blur_strength": 18, "bitrate": "15M", "description": "Balanced"},
     "high": {"fps": 30, "blur_strength": 22, "bitrate": "25M", "description": "Best quality"},
+    "youtube": {"fps": 30, "blur_strength": 22, "bitrate": "youtube", "description": "YouTube recommended"},
+    "max": {"fps": 30, "blur_strength": 22, "bitrate": "max", "description": "Maximum YouTube bitrate"},
+}
+
+RESOLUTION_PRESETS = {
+    "1080p": {"16x9": (1920, 1080), "9x16": (1080, 1920), "description": "Full HD"},
+    "1440p": {"16x9": (2560, 1440), "9x16": (1440, 2560), "description": "2K / Quad HD"},
+    "4k": {"16x9": (3840, 2160), "9x16": (2160, 3840), "description": "Ultra HD"},
+    "8k": {"16x9": (7680, 4320), "9x16": (4320, 7680), "description": "Maximum experimental"},
+}
+
+RESOLUTION_ALIASES = {
+    "2160p": "4k",
+    "4320p": "8k",
+}
+
+RESOLUTION_CHOICES = sorted(set(RESOLUTION_PRESETS) | set(RESOLUTION_ALIASES))
+
+YOUTUBE_SDR_BITRATES = {
+    "1080p": {"standard_fps": "8M", "high_fps": "12M", "max": "12M"},
+    "1440p": {"standard_fps": "16M", "high_fps": "24M", "max": "24M"},
+    "4k": {"standard_fps": "45M", "high_fps": "68M", "max": "68M"},
+    "8k": {"standard_fps": "160M", "high_fps": "240M", "max": "240M"},
 }
 
 MOTION_PRESETS = {
@@ -148,6 +171,42 @@ class RenderConfig:
 
 def natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def normalize_resolution(resolution: str) -> str:
+    normalized = resolution.strip().lower()
+    normalized = RESOLUTION_ALIASES.get(normalized, normalized)
+    if normalized not in RESOLUTION_PRESETS:
+        supported = ", ".join(RESOLUTION_CHOICES)
+        raise argparse.ArgumentTypeError(f"must be one of: {supported}")
+    return normalized
+
+
+def dimensions_for_target(fmt: str, resolution: str) -> Tuple[int, int]:
+    normalized = normalize_resolution(resolution)
+    try:
+        return RESOLUTION_PRESETS[normalized][fmt]  # type: ignore[return-value]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported format/resolution combination: {fmt}/{resolution}") from exc
+
+
+def resolve_output_bitrate(
+    quality_name: str,
+    resolution: str,
+    fps: int,
+    bitrate_override: Optional[str] = None,
+) -> str:
+    if bitrate_override is not None:
+        return bitrate_override
+
+    normalized_resolution = normalize_resolution(resolution)
+    preset_bitrate = QUALITY_PRESETS[quality_name]["bitrate"]
+    if preset_bitrate == "youtube":
+        frame_rate_key = "high_fps" if fps > 30 else "standard_fps"
+        return YOUTUBE_SDR_BITRATES[normalized_resolution][frame_rate_key]
+    if preset_bitrate == "max":
+        return YOUTUBE_SDR_BITRATES[normalized_resolution]["max"]
+    return preset_bitrate
 
 
 def ensure_dir(p: Path):
@@ -334,7 +393,11 @@ def ffmpeg_has_encoder(encoder_name: str) -> bool:
 def x264_tuning_for_quality(quality_name: str) -> Tuple[str, str]:
     if quality_name == "draft":
         return "28", "veryfast"
+    if quality_name == "max":
+        return "18", "slow"
     if quality_name == "high":
+        return "20", "slow"
+    if quality_name == "youtube":
         return "20", "slow"
     return "22", "fast"
 
@@ -1302,8 +1365,11 @@ def parse_args():
     ap.add_argument("source_dir", nargs="?")
     ap.add_argument("--outdir", default="./Renders")
     ap.add_argument("--workdir", default="./.work_pngs")
-    ap.add_argument("--quality", default="standard", choices=["draft", "standard", "high"])
+    ap.add_argument("--quality", default="standard", choices=["draft", "standard", "high", "youtube", "max"])
     ap.add_argument("--format", default="both", choices=["16x9", "9x16", "both"])
+    ap.add_argument("--resolution", default="1080p", type=normalize_resolution,
+                    choices=RESOLUTION_CHOICES,
+                    help="Output resolution: 1080p, 1440p, 4k/2160p, or 8k/4320p")
     ap.add_argument("--sort-by", default="natural", choices=["natural", "time", "location", "random"])
     ap.add_argument("--max-workers", type=int, default=0)
     ap.add_argument("--camera-stats", action="store_true")
@@ -1377,20 +1443,32 @@ def _slug(value: str) -> str:
     return token or "unnamed"
 
 
-def build_targets(fmt: str, stamp: str, input_dir_name: str, quality: str, transition: str, photo_count: int, clip_count: int = 0):
+def build_targets(
+    fmt: str,
+    stamp: str,
+    input_dir_name: str,
+    quality: str,
+    transition: str,
+    photo_count: int,
+    clip_count: int = 0,
+    resolution: str = "1080p",
+):
     """Build render targets using the agreed deterministic filename schema.
 
     Count suffix: n{photo_count} for photo-only renders; n{photo_count}c{clip_count} when clips are present.
     """
     count_str = f"n{photo_count}c{clip_count}" if clip_count > 0 else f"n{photo_count}"
     slug = _slug(input_dir_name)
+    res = _slug(normalize_resolution(resolution))
     q = _slug(quality)
     tr = _slug(transition)
     targets = []
     if fmt in ("16x9", "both"):
-        targets.append((f"{stamp}_{slug}_fmt16x9_q{q}_transition-{tr}_{count_str}.mp4", 1920, 1080))
+        width, height = dimensions_for_target("16x9", res)
+        targets.append((f"{stamp}_{slug}_fmt16x9_res{res}_q{q}_transition-{tr}_{count_str}.mp4", width, height))
     if fmt in ("9x16", "both"):
-        targets.append((f"{stamp}_{slug}_fmt9x16_q{q}_transition-{tr}_{count_str}.mp4", 1080, 1920))
+        width, height = dimensions_for_target("9x16", res)
+        targets.append((f"{stamp}_{slug}_fmt9x16_res{res}_q{q}_transition-{tr}_{count_str}.mp4", width, height))
     return targets
 
 
@@ -1741,6 +1819,10 @@ def build_label_overlay_paths_for_infos(
 
 def _validate_args(args) -> None:
     should_upload = args.youtube_upload or bool(args.youtube_upload_file)
+    try:
+        normalize_resolution(getattr(args, "resolution", "1080p"))
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"--resolution {exc}") from exc
     if args.sec <= 0:
         raise SystemExit("--sec must be > 0")
     if not (0 <= args.xfade < args.sec):
@@ -1859,6 +1941,8 @@ def main():
 
     preset = QUALITY_PRESETS[args.quality]
     fps = args.fps if args.fps is not None else preset["fps"]
+    resolution = normalize_resolution(getattr(args, "resolution", "1080p"))
+    bitrate = resolve_output_bitrate(args.quality, resolution, fps, args.bitrate)
     youtube_client_secrets = Path(args.youtube_client_secrets)
     youtube_token_file = Path(args.youtube_token_file)
     youtube_tags = parse_youtube_tags(args.youtube_tags)
@@ -1881,12 +1965,17 @@ def main():
             show_progress=args.progress,
         )
 
+    if resolution == "8k":
+        print(
+            "Warning: 8K output is experimental and can be very slow with very large files.",
+            file=sys.stderr,
+        )
+
     ensure_dir(Path(args.workdir))
     temp_work = Path(tempfile.mkdtemp(prefix="videophotoslide_", dir=str(Path(args.workdir))))
 
     try:
         blur = preset["blur_strength"]
-        bitrate = args.bitrate if args.bitrate is not None else preset["bitrate"]
 
         do_geocode = args.geocode or args.location_stats or args.location_overlay
         extract_exif = args.sort_by in ("time", "location") or args.camera_stats or do_geocode
@@ -1934,7 +2023,8 @@ def main():
         )
         print(
             "Render settings: "
-            f"encoder={encoder}, transition={args.transition}, motion={args.motion_style}, "
+            f"encoder={encoder}, resolution={resolution}, quality={args.quality}, "
+            f"fps={fps}, bitrate={bitrate}, transition={args.transition}, motion={args.motion_style}, "
             f"estimated_duration={estimated_total:.1f}s"
         )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1947,6 +2037,7 @@ def main():
             args.transition,
             n_photos,
             n_clips,
+            resolution=resolution,
         )
 
         if args.split_secs is not None:
