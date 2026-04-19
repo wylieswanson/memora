@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memora-motion"
+version = "0.1.0"
+description = "Memora Motion turns photo folders into polished slideshow videos."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Memora" }
+]
+dependencies = [
+    "Pillow>=10",
+    "numpy>=1.24",
+    "mediapipe>=0.10",
+    "google-api-python-client>=2.0",
+    "google-auth-httplib2>=0.2",
+    "google-auth-oauthlib>=1.0",
+]
+
+[project.scripts]
+memoramotion = "memoramotion:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools]
+py-modules = ["memoramotion"]

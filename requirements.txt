@@ -1,14 +1,6 @@
-# Core — required
-pillow
-numpy
-
-# Dev
-pytest
-
-# Optional — YouTube upload
-# google-api-python-client
-# google-auth-oauthlib
-# google-auth-httplib2
-
-# Optional — smart focus subject detection
-# mediapipe
+# Development install.
+# For end users, prefer:
+#   pipx install .
+# or:
+#   python -m pip install .
+-e .[dev]

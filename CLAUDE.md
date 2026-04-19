@@ -1,8 +1,8 @@
-# CLAUDE.md — video-workflow
+# CLAUDE.md — Memora Motion
 
 ## Project Overview
 
-**Memora: video-workflow** — a CLI tool that turns folders of photos and video clips into polished slideshow videos in 16x9 and 9x16 formats. Single script: `videophotoslide.py`. No web server, no database, no framework.
+**Memora Motion** — an installable Python CLI tool that turns folders of photos and video clips into polished slideshow videos in 16x9 and 9x16 formats. Main executable: `memoramotion`; implementation module: `memoramotion.py`. No web server, no database, no framework.
 
 Key output characteristics:
 - Deterministic, descriptive filenames: `<timestamp>_<folder>_fmt<format>_res<resolution>_q<quality>_transition-<transition>_n<photos>[c<clips>].mp4` — `c<clips>` suffix only appears when video clips are present
@@ -15,10 +15,10 @@ Key output characteristics:
 
 ## Architecture
 
-**Single file**: `videophotoslide.py` (~1,900 lines). No separate modules.
+**Single runtime module**: `memoramotion.py`. Packaging metadata lives in `pyproject.toml` and exposes the `memoramotion` console script.
 
 **Processing pipeline** (in execution order):
-0. If `--youtube-upload` is set, validate/refresh YouTube OAuth credentials before rendering so auth failures happen early
+0. Preflight `ffmpeg`/`ffprobe`; if `--youtube-upload` is set, validate/refresh YouTube OAuth credentials before rendering so auth failures happen early
 1. Scan input dir for supported files → `IMG_EXTS` + `VID_EXTS`
 2. Images: convert to normalized PNG in parallel → `convert_to_pngs()` / `_convert_single_image()`
    Video clips: probe via ffprobe → `probe_video_clip()`
@@ -92,13 +92,13 @@ The YouTube bitrate table mirrors the SDR H.264 recommendations in YouTube Help'
 Recommended practical YouTube command:
 
 ```bash
-python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+memoramotion ./input_photos --format both --resolution 4k --quality youtube
 ```
 
 Absolute largest built-in target:
 
 ```bash
-python videophotoslide.py ./input_photos --format 16x9 --resolution 8k --quality max
+memoramotion ./input_photos --format 16x9 --resolution 8k --quality max
 ```
 
 ---
@@ -109,7 +109,7 @@ python videophotoslide.py ./input_photos --format 16x9 --resolution 8k --quality
 - `mediapipe.tasks.python.vision.FaceDetector`
 - `mediapipe.tasks.python.vision.PoseLandmarker`
 
-Keep MediaPipe imports dynamic through `importlib.import_module()` so optional-dependency Pylance warnings do not fire for users who never enable smart focus. The Tasks API also needs model assets: by default the script downloads the Face Detector and Pose Landmarker models into `./.mediapipe_models`, while `--smart-focus-face-model` and `--smart-focus-pose-model` let callers pin local assets.
+Keep MediaPipe imports dynamic through `importlib.import_module()` so importing the CLI stays light for users who never enable smart focus. The Tasks API also needs model assets: by default the app downloads the Face Detector and Pose Landmarker models into `./.mediapipe_models`, while `--smart-focus-face-model` and `--smart-focus-pose-model` let callers pin local assets.
 
 When changing smart focus behavior, update `_get_mediapipe_detectors()`, `detect_subject_focus()`, model resolution flags, README install notes, and the MediaPipe tests together. Multiprocessing conversion relies on resolved model paths being passed through `_init_mediapipe_worker()` so spawned workers can initialize detectors cleanly.
 
@@ -175,41 +175,41 @@ Photos (`.jpg`, `.heic`, etc.) and video clips (`.mp4`, `.mov`) can be mixed fre
 
 ---
 
-## Running the Script
+## Running the CLI
 
 ```bash
 source .venv/bin/activate
-python videophotoslide.py <source_dir> [OPTIONS]
+memoramotion <source_dir> [OPTIONS]
 ```
 
 Common invocations:
 ```bash
 # Default: both formats, standard quality, auto transition
-python videophotoslide.py ./input_photos
+memoramotion ./input_photos
 
 # Dry run — prints ffmpeg command without rendering
-python videophotoslide.py ./input_photos --dry-run --progress
+memoramotion ./input_photos --dry-run --progress
 
 # Video clips only, muted, full grade treatment
-python videophotoslide.py "Photos/Videotest" --format 9x16
+memoramotion "Photos/Videotest" --format 9x16
 
 # Video clips with duck audio (background lowers during clips)
-python videophotoslide.py "Photos/Videotest" --format 9x16 --clip-audio duck --audio ./music.mp3
+memoramotion "Photos/Videotest" --format 9x16 --clip-audio duck --audio ./music.mp3
 
 # Vertical only, with Ken Burns and smart subject framing on photos
-python videophotoslide.py ./input_photos --format 9x16 --motion-style kenburns --smart-focus
+memoramotion ./input_photos --format 9x16 --motion-style kenburns --smart-focus
 
 # Practical maximum-quality YouTube render
-python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+memoramotion ./input_photos --format both --resolution 4k --quality youtube
 
 # Render and upload to YouTube
-python videophotoslide.py ./input_photos --format 16x9 --youtube-upload --youtube-privacy private
+memoramotion ./input_photos --format 16x9 --youtube-upload --youtube-privacy private
 
 # Upload existing render without re-rendering
-python videophotoslide.py --youtube-upload-file ./Renders/some.mp4 --youtube-title "{filename}"
+memoramotion --youtube-upload-file ./Renders/some.mp4 --youtube-title "{filename}"
 
 # Split long render into parts
-python videophotoslide.py ./input_photos --split-secs 60 --dry-run
+memoramotion ./input_photos --split-secs 60 --dry-run
 ```
 
 ---
@@ -218,10 +218,10 @@ python videophotoslide.py ./input_photos --split-secs 60 --dry-run
 
 ```bash
 source .venv/bin/activate
-python -m unittest tests/test_videophotoslide.py
+python -m unittest tests/test_memoramotion.py
 ```
 
-Test file: `tests/test_videophotoslide.py`. Uses `unittest` with mocking. Tests cover: metadata alignment after sorting, filename collision safety, resolution target generation, YouTube bitrate selection, transition validation, motion/parallax combinations, location overlay generation, and rhythm calculations.
+Test file: `tests/test_memoramotion.py`. Uses `unittest` with mocking. Tests cover: metadata alignment after sorting, filename collision safety, resolution target generation, YouTube bitrate selection, transition validation, motion/parallax combinations, location overlay generation, and rhythm calculations.
 
 When adding new features:
 - Add unit tests for any new pure functions
@@ -234,7 +234,7 @@ When adding new features:
 
 - **No external config files** — all settings are CLI args with defaults, no YAML/TOML/JSON config
 - **Path handling** — always use `pathlib.Path`, never string concatenation for paths
-- **Temp work directory** — `tempfile.mkdtemp(prefix="videophotoslide_", dir=args.workdir)` creates a session-specific subdir inside `--workdir` (default `./.work_pngs`). Only that subdir is deleted in `finally` — the workdir parent is never removed. Video clips are never copied; they're referenced at their original path.
+- **Temp work directory** — `tempfile.mkdtemp(prefix="memoramotion_", dir=args.workdir)` creates a session-specific subdir inside `--workdir` (default `./.work_pngs`). Only that subdir is deleted in `finally` — the workdir parent is never removed. Video clips are never copied; they're referenced at their original path.
 - **FFmpeg/ffprobe invocation** — build command as a list of strings, execute via `subprocess.run()`, never `shell=True`
 - **Encoder selection** — always check `ffmpeg_has_encoder("h264_videotoolbox")` at runtime, fall back to `libx264`
 - **Parallelism** — image conversion uses `multiprocessing.Pool`; clip probing and everything else is single-threaded
@@ -266,7 +266,7 @@ When adding new features:
 | google-auth-oauthlib | No | YouTube OAuth |
 | mediapipe | No | Smart focus subject detection |
 
-Install: `pip install pillow numpy` (core); see README for optional deps.
+Install for development with `pip install -r requirements.txt`; the project dependencies are declared in `pyproject.toml`.
 
 ---
 
@@ -274,8 +274,9 @@ Install: `pip install pillow numpy` (core); see README for optional deps.
 
 | File | Purpose |
 |---|---|
-| `videophotoslide.py` | Entire implementation |
-| `tests/test_videophotoslide.py` | Unit test suite |
+| `memoramotion.py` | Entire implementation |
+| `pyproject.toml` | Package metadata and `memoramotion` console-script entry point |
+| `tests/test_memoramotion.py` | Unit test suite |
 | `README.md` | User-facing docs and option table |
 | `client_secrets.json` | Google OAuth credentials (not committed) |
 | `.youtube_token.json` | Cached OAuth token (not committed) |

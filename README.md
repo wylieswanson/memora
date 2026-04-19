@@ -1,6 +1,6 @@
-# Memora: video-workflow (Photos to Professional Slideshows)
+# Memora Motion (Photos to Professional Slideshows)
 
-A practical workflow for turning photo folders into modern slideshow videos in 16x9 and 9x16.
+Memora Motion is a command-line app for turning photo folders into modern slideshow videos in 16x9 and 9x16.
 
 The current version is slideshow-only and focuses on high-ROI visual polish:
 - subtle filmic grade
@@ -13,7 +13,7 @@ The current version is slideshow-only and focuses on high-ROI visual polish:
 
 ## What this produces
 
-From a directory of photos and/or video clips, the script renders one or both aspect ratios at the selected resolution:
+From a directory of photos and/or video clips, the app renders one or both aspect ratios at the selected resolution:
 
 | Resolution | 16x9 output | 9x16 output | Notes |
 |---|---:|---:|---|
@@ -33,11 +33,12 @@ When video clips are present the count suffix includes both: `_n10c2` means 10 p
 ## Repository layout
 
 ```text
-video-workflow/
+memora-motion/
   input_photos/          # source photos
   Renders/               # output videos
   .work_pngs/            # parent for session temp dirs (--workdir); each render creates and removes a subdir
-  videophotoslide.py     # slideshow generator
+  memoramotion.py        # CLI implementation
+  pyproject.toml         # package metadata and memoramotion console script
 ```
 
 ---
@@ -45,7 +46,7 @@ video-workflow/
 ## Requirements
 
 - macOS (Apple Silicon recommended)
-- ffmpeg on PATH
+- ffmpeg and ffprobe on PATH
 - Python 3.11+
 
 Install ffmpeg with Homebrew:
@@ -55,28 +56,25 @@ brew install ffmpeg
 ffmpeg -version
 ```
 
-Python dependency:
+Install Memora Motion from this repository:
+
+```bash
+python -m pip install -U pip pipx
+pipx install .
+memoramotion --help
+```
+
+If you prefer a local virtual environment for development:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 pip install -r requirements.txt
+memoramotion --help
 ```
 
-Optional YouTube upload dependencies:
-
-```bash
-pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
-```
-
-Optional smart-focus dependency for subject-aware Ken Burns framing:
-
-```bash
-pip install mediapipe
-```
-
-`--smart-focus` uses MediaPipe Tasks. On first use, the script downloads the default Face Detector and Pose Landmarker model assets into `./.mediapipe_models`. Use the model override flags below if you want to pin or supply those assets manually.
+The Python installer includes the YouTube upload and smart-focus dependencies. `--smart-focus` uses MediaPipe Tasks. On first use, the app downloads the default Face Detector and Pose Landmarker model assets into `./.mediapipe_models`. Use the model override flags below if you want to pin or supply those assets manually.
 
 ---
 
@@ -88,7 +86,7 @@ Place photos into a folder such as input_photos. Supported extensions:
 Run:
 
 ```bash
-python videophotoslide.py ./input_photos
+memoramotion ./input_photos
 ```
 
 ---
@@ -141,7 +139,7 @@ python videophotoslide.py ./input_photos
 For routine YouTube uploads, use:
 
 ```bash
-python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+memoramotion ./input_photos --format both --resolution 4k --quality youtube
 ```
 
 Use `8k --quality max` only when you really want the largest supported render. It is useful as an archive or stress-test target, but it is usually overkill for normal slideshow uploads.
@@ -156,7 +154,7 @@ Quality presets:
 | `youtube` | 30 | Resolution-aware YouTube SDR bitrate; high-frame-rate value when `--fps > 30` | Recommended YouTube upload; Lanczos scaling |
 | `max` | 30 | Highest SDR bitrate in the table below | Largest built-in upload preset; Lanczos scaling |
 
-The `youtube` and `max` presets use the SDR H.264 bitrate guidance from YouTube's recommended upload settings. The script keeps the output as MP4/H.264 with `+faststart`, AAC audio when audio is present, progressive frames, and 4:2:0 chroma via `yuv420p`.
+The `youtube` and `max` presets use the SDR H.264 bitrate guidance from YouTube's recommended upload settings. The app keeps the output as MP4/H.264 with `+faststart`, AAC audio when audio is present, progressive frames, and 4:2:0 chroma via `yuv420p`.
 
 | Resolution | `youtube` at 24/25/30 fps | `youtube` at 48/50/60 fps | `max` |
 |---|---:|---:|---:|
@@ -173,28 +171,28 @@ Examples:
 
 ```bash
 # Default two-format render
-python videophotoslide.py ./input_photos
+memoramotion ./input_photos
 
 # Longer photos and softer transitions
-python videophotoslide.py ./input_photos --sec 3.5 --xfade 0.9
+memoramotion ./input_photos --sec 3.5 --xfade 0.9
 
 # Stronger editorial pacing and auto transition rotation
-python videophotoslide.py ./input_photos --transition auto --rhythm-strength 0.18
+memoramotion ./input_photos --transition auto --rhythm-strength 0.18
 
 # Vertical-only output
-python videophotoslide.py ./input_photos --format 9x16
+memoramotion ./input_photos --format 9x16
 
 # Practical maximum-quality YouTube render
-python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+memoramotion ./input_photos --format both --resolution 4k --quality youtube
 
 # Absolute max preset; expect long renders and very large files
-python videophotoslide.py ./input_photos --format 16x9 --resolution 8k --quality max
+memoramotion ./input_photos --format 16x9 --resolution 8k --quality max
 
 # Ken Burns with subject-aware framing
-python videophotoslide.py ./input_photos --motion-style kenburns --smart-focus
+memoramotion ./input_photos --motion-style kenburns --smart-focus
 
 # Render and upload to YouTube as private
-python videophotoslide.py ./input_photos \
+memoramotion ./input_photos \
   --format 16x9 \
   --youtube-upload \
   --youtube-title "{input_dir} | {format}" \
@@ -202,14 +200,14 @@ python videophotoslide.py ./input_photos \
   --youtube-tags "travel,arizona,slideshow"
 
 # Upload an existing render without re-rendering
-python videophotoslide.py \
+memoramotion \
   --youtube-upload-file ./Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_res1080p_qstandard_transition-auto_n12.mp4 \
   --youtube-title "{filename}" \
   --youtube-description "Fresh slideshow render" \
   --youtube-tags "travel,arizona,slideshow"
 
 # Render and import finished videos into macOS Photos
-python videophotoslide.py ./input_photos --add-to-photos
+memoramotion ./input_photos --add-to-photos
 ```
 
 ---
@@ -222,11 +220,11 @@ To publish directly after rendering:
 2. Enable `YouTube Data API v3`.
 3. Create an OAuth client for a Desktop app.
 4. Download the OAuth client JSON to `client_secrets.json` in the repo root, or point `--youtube-client-secrets` at it.
-5. Run the script with `--youtube-upload`.
+5. Run Memora Motion with `--youtube-upload`.
 
-On first upload, the script opens a browser for Google consent and stores a reusable token in `.youtube_token.json`.
+On first upload, the app opens a browser for Google consent and stores a reusable token in `.youtube_token.json`.
 
-If `--youtube-upload` is enabled during a render, the script validates or refreshes the OAuth token before rendering starts so expired or revoked credentials fail fast instead of after a long render.
+If `--youtube-upload` is enabled during a render, the app validates or refreshes the OAuth token before rendering starts so expired or revoked credentials fail fast instead of after a long render.
 
 If a render succeeds but upload fails, rerun with `--youtube-upload-file` pointed at the existing `.mp4` to retry the upload without rendering again.
 
@@ -235,7 +233,7 @@ If a render succeeds but upload fails, rerun with `--youtube-upload-file` pointe
 Notes:
 - The uploader uses the YouTube Data API `videos.insert` flow.
 - Uploads default to `private`.
-- If you render both aspect ratios, the script uploads both outputs.
+- If you render both aspect ratios, the app uploads both outputs.
 
 ---
 
@@ -286,5 +284,5 @@ ffmpeg not found:
 
 ## Notes
 
-- The script always cleans temporary work files after completion.
+- The app always cleans temporary work files after completion.
 - Output filenames are intentionally descriptive for easier version tracking.

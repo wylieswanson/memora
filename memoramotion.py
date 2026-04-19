@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-VideoPhotoSlide
-A safer, cleaner slideshow generator derived from make_slideshow2.py.
+Memora Motion
+A practical CLI for turning photo folders into polished slideshow videos.
 """
 
 import argparse
@@ -26,6 +26,10 @@ from typing import Any, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+APP_NAME = "Memora Motion"
+APP_VERSION = "0.1.0"
+USER_AGENT = f"memoramotion/{APP_VERSION} (Memora Motion slideshow tool)"
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".heic", ".heif"}
 VID_EXTS = {".mp4", ".mov"}
@@ -219,6 +223,16 @@ def progress_print(enabled: bool, message: str) -> None:
         print(message, flush=True)
 
 
+def preflight_media_tools() -> None:
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise SystemExit(
+            f"{APP_NAME} requires {missing_list} on PATH. "
+            "Install ffmpeg with Homebrew: brew install ffmpeg"
+        )
+
+
 _MEDIAPIPE_FACE_DETECTOR: Optional[Any] = None
 _MEDIAPIPE_POSE_DETECTOR: Optional[Any] = None
 _MEDIAPIPE_FACE_MODEL_PATH: Optional[Path] = None
@@ -335,7 +349,8 @@ def _get_mediapipe_task_modules() -> Tuple[Any, Any, Any]:
         vision = importlib.import_module("mediapipe.tasks.python.vision")
     except ImportError as exc:
         raise SystemExit(
-            "Smart focus requires MediaPipe Tasks. Install: pip install mediapipe"
+            f"{APP_NAME} was installed without MediaPipe Tasks. "
+            "Reinstall with dependencies: python -m pip install ."
         ) from exc
     return mp, mp_python, vision
 
@@ -1560,7 +1575,7 @@ def validate_transition(transition: str) -> str:
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Create slideshow videos from photos.")
+    ap = argparse.ArgumentParser(description=f"Create {APP_NAME} slideshow videos from photos.")
     ap.add_argument("source_dir", nargs="?")
     ap.add_argument("--outdir", default="./Renders")
     ap.add_argument("--workdir", default="./.work_pngs")
@@ -1728,7 +1743,7 @@ def _nominatim_reverse(lat: float, lon: float) -> Optional[dict]:
     )
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "videophotoslide/1.0 (personal slideshow tool)"},
+        headers={"User-Agent": USER_AGENT},
     )
     try:
         _GEOCODE_LAST_CALL = time.time()
@@ -1911,8 +1926,8 @@ def _load_youtube_credentials(token_file: Path, client_secrets: Path):
         from google_auth_oauthlib.flow import InstalledAppFlow
     except ImportError as exc:
         raise SystemExit(
-            "YouTube upload requires Google API libraries. "
-            "Install: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+            f"{APP_NAME} was installed without the Google API libraries required for YouTube upload. "
+            "Reinstall with dependencies: python -m pip install ."
         ) from exc
 
     scopes = ["https://www.googleapis.com/auth/youtube.upload"]
@@ -1952,8 +1967,8 @@ def upload_video_to_youtube(
         from googleapiclient.http import MediaFileUpload
     except ImportError as exc:
         raise SystemExit(
-            "YouTube upload requires Google API libraries. "
-            "Install: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+            f"{APP_NAME} was installed without the Google API libraries required for YouTube upload. "
+            "Reinstall with dependencies: python -m pip install ."
         ) from exc
 
     creds = _load_youtube_credentials(token_file=token_file, client_secrets=client_secrets)
@@ -2167,6 +2182,8 @@ def main():
     if not src.exists() or not src.is_dir():
         raise SystemExit(f"Missing source directory: {src}")
 
+    preflight_media_tools()
+
     if args.youtube_upload and not args.dry_run:
         _preflight_youtube_upload(
             client_secrets=youtube_client_secrets,
@@ -2181,7 +2198,7 @@ def main():
         )
 
     ensure_dir(Path(args.workdir))
-    temp_work = Path(tempfile.mkdtemp(prefix="videophotoslide_", dir=str(Path(args.workdir))))
+    temp_work = Path(tempfile.mkdtemp(prefix="memoramotion_", dir=str(Path(args.workdir))))
 
     try:
         blur = preset["blur_strength"]

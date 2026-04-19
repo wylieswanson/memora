@@ -1,5 +1,6 @@
 import argparse
 import json
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime
@@ -11,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
-import videophotoslide as vps
+import memoramotion as vps
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ def _make_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-class VideoPhotoSlideTests(unittest.TestCase):
+class MemoraMotionTests(unittest.TestCase):
     def _info(self, name: str, dt=None, gps=None):
         return vps.PhotoInfo(
             path=Path(name),
@@ -258,7 +259,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
         self.assertIn("must be one of:", str(ctx.exception))
 
     def test_parse_args_rejects_invalid_transition(self):
-        with patch("sys.argv", ["videophotoslide.py", "./input_photos", "--transition", "bad-transition"]):
+        with patch("sys.argv", ["memoramotion", "./input_photos", "--transition", "bad-transition"]):
             with self.assertRaises(SystemExit):
                 vps.parse_args()
 
@@ -301,7 +302,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             old_pose_model = vps._MEDIAPIPE_POSE_MODEL_PATH
             try:
                 vps.configure_smart_focus_models(face_model, pose_model)
-                with patch("videophotoslide.importlib.import_module", side_effect=fake_import_module):
+                with patch("memoramotion.importlib.import_module", side_effect=fake_import_module):
                     self.assertEqual(vps._get_mediapipe_detectors(), (face_detector, pose_detector))
             finally:
                 vps._MEDIAPIPE_FACE_DETECTOR = old_face_detector
@@ -324,7 +325,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
             pose_model.write_bytes(b"pose")
             try:
                 vps.configure_smart_focus_models(face_model, pose_model)
-                with patch("videophotoslide.importlib.import_module", side_effect=ModuleNotFoundError("mediapipe")):
+                with patch("memoramotion.importlib.import_module", side_effect=ModuleNotFoundError("mediapipe")):
                     with self.assertRaises(SystemExit) as ctx:
                         vps._get_mediapipe_detectors()
             finally:
@@ -441,7 +442,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
     # -----------------------------------------------------------------------
 
     def test_import_media_to_photos_uses_osascript(self):
-        with patch("videophotoslide.subprocess.run") as mock_run:
+        with patch("memoramotion.subprocess.run") as mock_run:
             vps.import_media_to_photos([Path("Renders/render.mp4")])
 
         cmd = mock_run.call_args.args[0]
@@ -584,14 +585,16 @@ class VideoPhotoSlideTests(unittest.TestCase):
     # -----------------------------------------------------------------------
 
     def test_probe_video_clip_returns_none_on_probe_failure(self):
-        with patch("videophotoslide.subprocess.run") as mock_run:
+        with patch("memoramotion.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
             mock_run.return_value.stdout = "not valid json"
             result = vps.probe_video_clip(Path("missing.mp4"))
         self.assertIsNone(result)
 
     def test_probe_video_clip_returns_none_when_no_video_stream(self):
         payload = json.dumps({"streams": [{"codec_type": "audio"}], "format": {}})
-        with patch("videophotoslide.subprocess.run") as mock_run:
+        with patch("memoramotion.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
             mock_run.return_value.stdout = payload
             result = vps.probe_video_clip(Path("audio_only.mp4"))
         self.assertIsNone(result)
@@ -609,7 +612,8 @@ class VideoPhotoSlideTests(unittest.TestCase):
                 "tags": {"creation_time": "2026-04-05T12:00:00.000000Z"},
             },
         })
-        with patch("videophotoslide.subprocess.run") as mock_run:
+        with patch("memoramotion.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
             mock_run.return_value.stdout = payload
             result = vps.probe_video_clip(Path("clip.mp4"))
 
@@ -652,7 +656,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
                 is_video=True, video_duration=5.0,
             )
 
-            with patch("videophotoslide.probe_video_clip", return_value=fake_info):
+            with patch("memoramotion.probe_video_clip", return_value=fake_info):
                 paths, infos = vps.collect_media(tmp_path, work)
 
         # Image comes first (natural sort), clip second
@@ -739,7 +743,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
         proc.stdout = iter(["frame=1\n", "Impossible to convert between formats\n"])
         proc.wait.return_value = 1
 
-        with patch("videophotoslide.subprocess.Popen", return_value=proc):
+        with patch("memoramotion.subprocess.Popen", return_value=proc):
             with self.assertRaises(RuntimeError) as ctx:
                 vps.run_ffmpeg_with_progress(["ffmpeg"], total_duration=3.0)
 
@@ -751,7 +755,7 @@ class VideoPhotoSlideTests(unittest.TestCase):
         images = [Path("work/000000_a.png")]
         cfg = vps.RenderConfig(encoder="h264_videotoolbox")
 
-        with patch("videophotoslide.run_ffmpeg_with_progress") as mock_run:
+        with patch("memoramotion.run_ffmpeg_with_progress") as mock_run:
             mock_run.side_effect = [
                 RuntimeError("ffmpeg render failed with exit code 187.\nError while opening encoder"),
                 None,
@@ -771,27 +775,28 @@ class VideoPhotoSlideTests(unittest.TestCase):
 
     def test_main_smoke_prints_render_settings_and_outputs(self):
         with TemporaryDirectory() as tmp:
-            session_dir = str(Path(tmp) / "videophotoslide_test")
+            session_dir = str(Path(tmp) / "memoramotion_test")
             args = _make_args(motion_style="kenburns", seed=7, workdir=tmp)
             images = [Path("work/000000_a.png"), Path("work/000001_b.png")]
             infos = [self._info("a.png"), self._info("b.png")]
             fake_output_stat = SimpleNamespace(st_size=5 * 1024 * 1024)
 
             stream = StringIO()
-            with patch("videophotoslide.parse_args", return_value=args), \
-                 patch("videophotoslide.collect_media", return_value=(images, infos)), \
-                 patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
-                 patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.tempfile.mkdtemp", return_value=session_dir), \
-                 patch("videophotoslide.datetime") as mock_datetime, \
-                 patch("videophotoslide.ensure_dir"), \
-                 patch("videophotoslide.import_media_to_photos") as mock_import, \
-                 patch("videophotoslide.render") as mock_render, \
-                 patch("videophotoslide.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
+            with patch("memoramotion.parse_args", return_value=args), \
+                 patch("memoramotion.preflight_media_tools"), \
+                 patch("memoramotion.collect_media", return_value=(images, infos)), \
+                 patch("memoramotion.sort_images_and_infos", return_value=(images, infos)), \
+                 patch("memoramotion.ffmpeg_has_encoder", return_value=False), \
+                 patch("memoramotion.tempfile.mkdtemp", return_value=session_dir), \
+                 patch("memoramotion.datetime") as mock_datetime, \
+                 patch("memoramotion.ensure_dir"), \
+                 patch("memoramotion.import_media_to_photos") as mock_import, \
+                 patch("memoramotion.render") as mock_render, \
+                 patch("memoramotion.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
                  patch("pathlib.Path.exists", return_value=True), \
                  patch("pathlib.Path.is_dir", return_value=True), \
                  patch("pathlib.Path.stat", return_value=fake_output_stat), \
-                 patch("videophotoslide.shutil.rmtree") as mock_rmtree, \
+                 patch("memoramotion.shutil.rmtree") as mock_rmtree, \
                  redirect_stdout(stream):
                 mock_datetime.now.return_value.strftime.return_value = "20260322-120000"
                 vps.main()
@@ -825,21 +830,22 @@ class VideoPhotoSlideTests(unittest.TestCase):
             fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
 
             stream = StringIO()
-            with patch("videophotoslide.parse_args", return_value=args), \
-                 patch("videophotoslide.collect_media", return_value=(images, infos)), \
-                 patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
-                 patch("videophotoslide._load_youtube_credentials"), \
-                 patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.datetime") as mock_datetime, \
-                 patch("videophotoslide.ensure_dir"), \
-                 patch("videophotoslide.import_media_to_photos"), \
-                 patch("videophotoslide.render"), \
-                 patch("videophotoslide.upload_video_to_youtube", return_value="abc123") as mock_upload, \
-                 patch("videophotoslide.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
+            with patch("memoramotion.parse_args", return_value=args), \
+                 patch("memoramotion.preflight_media_tools"), \
+                 patch("memoramotion.collect_media", return_value=(images, infos)), \
+                 patch("memoramotion.sort_images_and_infos", return_value=(images, infos)), \
+                 patch("memoramotion._load_youtube_credentials"), \
+                 patch("memoramotion.ffmpeg_has_encoder", return_value=False), \
+                 patch("memoramotion.datetime") as mock_datetime, \
+                 patch("memoramotion.ensure_dir"), \
+                 patch("memoramotion.import_media_to_photos"), \
+                 patch("memoramotion.render"), \
+                 patch("memoramotion.upload_video_to_youtube", return_value="abc123") as mock_upload, \
+                 patch("memoramotion.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
                  patch("pathlib.Path.exists", return_value=True), \
                  patch("pathlib.Path.is_dir", return_value=True), \
                  patch("pathlib.Path.stat", return_value=fake_output_stat), \
-                 patch("videophotoslide.shutil.rmtree"), \
+                 patch("memoramotion.shutil.rmtree"), \
                  redirect_stdout(stream):
                 mock_datetime.now.return_value.strftime.return_value = "20260322-120000"
                 vps.main()
@@ -861,10 +867,11 @@ class VideoPhotoSlideTests(unittest.TestCase):
     def test_main_fails_before_render_if_youtube_auth_preflight_fails(self):
         args = _make_args(youtube_upload=True)
 
-        with patch("videophotoslide.parse_args", return_value=args), \
-             patch("videophotoslide.ensure_dir"), \
-             patch("videophotoslide._load_youtube_credentials", side_effect=SystemExit("auth expired")), \
-             patch("videophotoslide.render") as mock_render, \
+        with patch("memoramotion.parse_args", return_value=args), \
+             patch("memoramotion.preflight_media_tools"), \
+             patch("memoramotion.ensure_dir"), \
+             patch("memoramotion._load_youtube_credentials", side_effect=SystemExit("auth expired")), \
+             patch("memoramotion.render") as mock_render, \
              patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.is_dir", return_value=True):
             with self.assertRaises(SystemExit) as ctx:
@@ -883,8 +890,9 @@ class VideoPhotoSlideTests(unittest.TestCase):
         )
         stream = StringIO()
 
-        with patch("videophotoslide.parse_args", return_value=args), \
-             patch("videophotoslide.upload_video_to_youtube", return_value="xyz789") as mock_upload, \
+        with patch("memoramotion.parse_args", return_value=args), \
+             patch("memoramotion.preflight_media_tools"), \
+             patch("memoramotion.upload_video_to_youtube", return_value="xyz789") as mock_upload, \
              patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.is_file", return_value=True), \
              redirect_stdout(stream):
@@ -912,8 +920,9 @@ class VideoPhotoSlideTests(unittest.TestCase):
         )
         stream = StringIO()
 
-        with patch("videophotoslide.parse_args", return_value=args), \
-             patch("videophotoslide.upload_video_to_youtube", return_value="xyz789") as mock_upload, \
+        with patch("memoramotion.parse_args", return_value=args), \
+             patch("memoramotion.preflight_media_tools"), \
+             patch("memoramotion.upload_video_to_youtube", return_value="xyz789") as mock_upload, \
              patch("pathlib.Path.exists", return_value=True), \
              patch("pathlib.Path.is_file", return_value=True), \
              redirect_stdout(stream):
@@ -931,19 +940,20 @@ class VideoPhotoSlideTests(unittest.TestCase):
             fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
 
             stream = StringIO()
-            with patch("videophotoslide.parse_args", return_value=args), \
-                 patch("videophotoslide.collect_media", return_value=(images, infos)), \
-                 patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
-                 patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.datetime") as mock_datetime, \
-                 patch("videophotoslide.ensure_dir"), \
-                 patch("videophotoslide.import_media_to_photos") as mock_import, \
-                 patch("videophotoslide.render"), \
-                 patch("videophotoslide.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
+            with patch("memoramotion.parse_args", return_value=args), \
+                 patch("memoramotion.preflight_media_tools"), \
+                 patch("memoramotion.collect_media", return_value=(images, infos)), \
+                 patch("memoramotion.sort_images_and_infos", return_value=(images, infos)), \
+                 patch("memoramotion.ffmpeg_has_encoder", return_value=False), \
+                 patch("memoramotion.datetime") as mock_datetime, \
+                 patch("memoramotion.ensure_dir"), \
+                 patch("memoramotion.import_media_to_photos") as mock_import, \
+                 patch("memoramotion.render"), \
+                 patch("memoramotion.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
                  patch("pathlib.Path.exists", return_value=True), \
                  patch("pathlib.Path.is_dir", return_value=True), \
                  patch("pathlib.Path.stat", return_value=fake_output_stat), \
-                 patch("videophotoslide.shutil.rmtree"), \
+                 patch("memoramotion.shutil.rmtree"), \
                  redirect_stdout(stream):
                 mock_datetime.now.return_value.strftime.return_value = "20260322-120000"
                 vps.main()
@@ -961,22 +971,23 @@ class VideoPhotoSlideTests(unittest.TestCase):
             fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
 
             stream = StringIO()
-            with patch("videophotoslide.parse_args", return_value=args), \
-                 patch("videophotoslide.collect_media", return_value=(images, infos)) as mock_collect, \
-                 patch("videophotoslide.resolve_smart_focus_model_paths",
+            with patch("memoramotion.parse_args", return_value=args), \
+                 patch("memoramotion.preflight_media_tools"), \
+                 patch("memoramotion.collect_media", return_value=(images, infos)) as mock_collect, \
+                 patch("memoramotion.resolve_smart_focus_model_paths",
                        return_value=(Path(tmp) / "face.tflite", Path(tmp) / "pose.task")) as mock_models, \
-                 patch("videophotoslide.configure_smart_focus_models") as mock_configure, \
-                 patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
-                 patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.datetime") as mock_datetime, \
-                 patch("videophotoslide.ensure_dir"), \
-                 patch("videophotoslide.import_media_to_photos"), \
-                 patch("videophotoslide.render") as mock_render, \
-                 patch("videophotoslide.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
+                 patch("memoramotion.configure_smart_focus_models") as mock_configure, \
+                 patch("memoramotion.sort_images_and_infos", return_value=(images, infos)), \
+                 patch("memoramotion.ffmpeg_has_encoder", return_value=False), \
+                 patch("memoramotion.datetime") as mock_datetime, \
+                 patch("memoramotion.ensure_dir"), \
+                 patch("memoramotion.import_media_to_photos"), \
+                 patch("memoramotion.render") as mock_render, \
+                 patch("memoramotion.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
                  patch("pathlib.Path.exists", return_value=True), \
                  patch("pathlib.Path.is_dir", return_value=True), \
                  patch("pathlib.Path.stat", return_value=fake_output_stat), \
-                 patch("videophotoslide.shutil.rmtree"), \
+                 patch("memoramotion.shutil.rmtree"), \
                  redirect_stdout(stream):
                 mock_datetime.now.return_value.strftime.return_value = "20260322-120000"
                 vps.main()
@@ -995,19 +1006,20 @@ class VideoPhotoSlideTests(unittest.TestCase):
             fake_output_stat = SimpleNamespace(st_size=2 * 1024 * 1024)
 
             stream = StringIO()
-            with patch("videophotoslide.parse_args", return_value=args), \
-                 patch("videophotoslide.collect_media", return_value=(images, infos)), \
-                 patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
-                 patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
-                 patch("videophotoslide.datetime") as mock_datetime, \
-                 patch("videophotoslide.ensure_dir"), \
-                 patch("videophotoslide.import_media_to_photos"), \
-                 patch("videophotoslide.render"), \
-                 patch("videophotoslide.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
+            with patch("memoramotion.parse_args", return_value=args), \
+                 patch("memoramotion.preflight_media_tools"), \
+                 patch("memoramotion.collect_media", return_value=(images, infos)), \
+                 patch("memoramotion.sort_images_and_infos", return_value=(images, infos)), \
+                 patch("memoramotion.ffmpeg_has_encoder", return_value=False), \
+                 patch("memoramotion.datetime") as mock_datetime, \
+                 patch("memoramotion.ensure_dir"), \
+                 patch("memoramotion.import_media_to_photos"), \
+                 patch("memoramotion.render"), \
+                 patch("memoramotion.build_targets", return_value=[("render.mp4", 1920, 1080)]), \
                  patch("pathlib.Path.exists", return_value=True), \
                  patch("pathlib.Path.is_dir", return_value=True), \
                  patch("pathlib.Path.stat", return_value=fake_output_stat), \
-                 patch("videophotoslide.shutil.rmtree"), \
+                 patch("memoramotion.shutil.rmtree"), \
                  redirect_stdout(stream):
                 mock_datetime.now.return_value.strftime.return_value = "20260322-120000"
                 vps.main()
@@ -1138,6 +1150,24 @@ class VideoPhotoSlideTests(unittest.TestCase):
         audio_map_idx = cmd.index("-map", cmd.index("-map") + 1)
         self.assertEqual(cmd[audio_map_idx + 1], "[aout]")
 
+    def test_preflight_media_tools_reports_missing_ffmpeg(self):
+        with patch("memoramotion.shutil.which", return_value=None):
+            with self.assertRaises(SystemExit) as ctx:
+                vps.preflight_media_tools()
+
+        message = str(ctx.exception)
+        self.assertIn("Memora Motion requires ffmpeg, ffprobe on PATH", message)
+        self.assertIn("brew install ffmpeg", message)
+
+    def test_pyproject_exposes_memoramotion_console_script(self):
+        pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+
+        self.assertEqual(pyproject["project"]["name"], "memora-motion")
+        self.assertEqual(pyproject["project"]["scripts"]["memoramotion"], "memoramotion:main")
+        dependencies = set(pyproject["project"]["dependencies"])
+        self.assertIn("mediapipe>=0.10", dependencies)
+        self.assertIn("google-api-python-client>=2.0", dependencies)
+
     # -----------------------------------------------------------------------
     # dry-run skips YouTube preflight
     # -----------------------------------------------------------------------
@@ -1146,9 +1176,10 @@ class VideoPhotoSlideTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             args = _make_args(youtube_upload=True, dry_run=True, source_dir=tmp, workdir=tmp)
 
-            with patch("videophotoslide.parse_args", return_value=args), \
-                 patch("videophotoslide.ensure_dir"), \
-                 patch("videophotoslide._load_youtube_credentials") as mock_creds:
+            with patch("memoramotion.parse_args", return_value=args), \
+                 patch("memoramotion.preflight_media_tools"), \
+                 patch("memoramotion.ensure_dir"), \
+                 patch("memoramotion._load_youtube_credentials") as mock_creds:
                 with self.assertRaises(SystemExit):
                     # Will exit when no media is found, but preflight must not fire
                     vps.main()
@@ -1160,32 +1191,32 @@ class VideoPhotoSlideTests(unittest.TestCase):
     # -----------------------------------------------------------------------
 
     def test_parse_args_defaults_to_renders_folder(self):
-        with patch("sys.argv", ["videophotoslide.py", "./input_photos"]):
+        with patch("sys.argv", ["memoramotion", "./input_photos"]):
             args = vps.parse_args()
         self.assertEqual(args.outdir, "./Renders")
         self.assertEqual(args.resolution, "1080p")
         self.assertFalse(args.progress)
 
     def test_parse_args_accepts_resolution_alias_and_youtube_quality(self):
-        with patch("sys.argv", ["videophotoslide.py", "./input_photos",
+        with patch("sys.argv", ["memoramotion", "./input_photos",
                                 "--resolution", "2160p", "--quality", "youtube"]):
             args = vps.parse_args()
         self.assertEqual(args.resolution, "4k")
         self.assertEqual(args.quality, "youtube")
 
     def test_parse_args_allows_upload_only_mode_without_source_dir(self):
-        with patch("sys.argv", ["videophotoslide.py", "--youtube-upload-file", "./Renders/render.mp4"]):
+        with patch("sys.argv", ["memoramotion", "--youtube-upload-file", "./Renders/render.mp4"]):
             args = vps.parse_args()
         self.assertIsNone(args.source_dir)
         self.assertEqual(args.youtube_upload_file, "./Renders/render.mp4")
 
     def test_parse_args_accepts_progress_flag(self):
-        with patch("sys.argv", ["videophotoslide.py", "./input_photos", "--progress"]):
+        with patch("sys.argv", ["memoramotion", "./input_photos", "--progress"]):
             args = vps.parse_args()
         self.assertTrue(args.progress)
 
     def test_parse_args_accepts_clip_grade_and_clip_audio(self):
-        with patch("sys.argv", ["videophotoslide.py", "./input_photos",
+        with patch("sys.argv", ["memoramotion", "./input_photos",
                                 "--clip-grade", "grade", "--clip-audio", "duck"]):
             args = vps.parse_args()
         self.assertEqual(args.clip_grade, "grade")

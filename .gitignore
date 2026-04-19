@@ -2,9 +2,13 @@
 tests/.DS_Store
 .youtube_token.json
 .mediapipe_models/
+build/
+dist/
+*.egg-info/
 Photos/
 Renders/
 __pycache__/
+*.pyc
 client_secrets.json
 input_photos/
 input_test/
