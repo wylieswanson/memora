@@ -59,6 +59,13 @@ RESOLUTION_PRESETS = {
     "8k": {"16x9": (7680, 4320), "9x16": (4320, 7680)},
 }
 
+YOUTUBE_SDR_BITRATES = {
+    "1080p": {"standard_fps": "8M", "high_fps": "12M", "max": "12M"},
+    "1440p": {"standard_fps": "16M", "high_fps": "24M", "max": "24M"},
+    "4k": {"standard_fps": "45M", "high_fps": "68M", "max": "68M"},
+    "8k": {"standard_fps": "160M", "high_fps": "240M", "max": "240M"},
+}
+
 MOTION_PRESETS = {
     "none":     {"ken": 0.0,    "parallax_ratio": 0.0},
     "kenburns": {"ken": 0.0015, "parallax_ratio": 0.0},
@@ -68,6 +75,43 @@ MOTION_PRESETS = {
 
 PRO_TRANSITIONS = ["fade", "smoothleft", "smoothright"]  # auto mode rotates through these
 ```
+
+---
+
+## Resolution and Quality
+
+`--format` chooses aspect ratio (`16x9`, `9x16`, or `both`). `--resolution` chooses the pixel dimensions for each aspect ratio. `build_targets()` combines them and includes `_res<resolution>` in filenames so different resolution renders do not collide.
+
+`--quality youtube` and `--quality max` do not use fixed bitrates from `QUALITY_PRESETS`. `main()` calls `resolve_output_bitrate()` after resolving `fps` and normalized `resolution`:
+- `youtube`: uses `standard_fps` for `fps <= 30`, `high_fps` for `fps > 30`
+- `max`: uses the table's `max` value regardless of fps
+- `--bitrate` always wins over the preset
+
+The YouTube bitrate table mirrors the SDR H.264 recommendations in YouTube Help's recommended upload encoding settings. Re-check that source before changing these values. YouTube also currently documents a 256 GB or 12 hour maximum upload size for verified accounts, whichever is less.
+
+Recommended practical YouTube command:
+
+```bash
+python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+```
+
+Absolute largest built-in target:
+
+```bash
+python videophotoslide.py ./input_photos --format 16x9 --resolution 8k --quality max
+```
+
+---
+
+## Smart Focus and MediaPipe
+
+`--smart-focus` is optional and lazy-loads MediaPipe only when subject-aware Ken Burns framing is requested. The current implementation uses MediaPipe Tasks:
+- `mediapipe.tasks.python.vision.FaceDetector`
+- `mediapipe.tasks.python.vision.PoseLandmarker`
+
+Keep MediaPipe imports dynamic through `importlib.import_module()` so optional-dependency Pylance warnings do not fire for users who never enable smart focus. The Tasks API also needs model assets: by default the script downloads the Face Detector and Pose Landmarker models into `./.mediapipe_models`, while `--smart-focus-face-model` and `--smart-focus-pose-model` let callers pin local assets.
+
+When changing smart focus behavior, update `_get_mediapipe_detectors()`, `detect_subject_focus()`, model resolution flags, README install notes, and the MediaPipe tests together. Multiprocessing conversion relies on resolved model paths being passed through `_init_mediapipe_worker()` so spawned workers can initialize detectors cleanly.
 
 ---
 
@@ -99,7 +143,7 @@ Photos (`.jpg`, `.heic`, etc.) and video clips (`.mp4`, `.mov`) can be mixed fre
 | `probe_video_clip(path)` | ffprobe a clip → `PhotoInfo(is_video=True, video_duration=...)` |
 | `collect_media(input_dir, ...)` | Entry point for main; merges images + clips in natural sort order |
 | `build_media_durations(infos, ...)` | Per-item durations: clips → natural duration; photos → rhythm-varied `--sec` |
-| `_media_start_times(durations, xfade)` | Timeline start offsets per item (used for `adelay` in audio filters) |
+| `_media_start_times(durations, xfade)` | Timeline start offsets per item — used for both `adelay` in audio filters and `offset` in `build_xfade_chain()` |
 | `build_filter_for_clip(i, ...)` | ffmpeg filter chain for a clip: bg+fg composite, optional grade/vignette/grain |
 | `_build_clip_audio_filters(...)` | Builds audio `filter_complex` fragment for `keep`/`duck` → `[aout]` |
 
@@ -110,17 +154,22 @@ Photos (`.jpg`, `.heic`, etc.) and video clips (`.mp4`, `.mov`) can be mixed fre
 **Photos** — `build_filter_for_still()`:
 - Input via `-loop 1 -t <dur>` (still image looped for its duration)
 - **No motion** (`ken_strength == 0`): `scale (bg fill, increase) → boxblur` + `scale (fg fit, decrease)` → `overlay=(W-w)/2:(H-h)/2` → grade → vignette → grain. Optional parallax animates the overlay x position.
-- **Ken Burns** (`ken_strength > 0`): same bg path as no-motion; fg uses `scale (decrease, fit) → scale (zoom, eval=frame)`; overlay x/y pan from `start_fx`/`start_fy` to `end_fx`/`end_fy` animated with ease function. Both paths always show the blurred background, preserving portrait photos in landscape output.
+- **Ken Burns** (`ken_strength > 0`): same bg path as no-motion; fg uses `scale (decrease, fit) → fps/trim/setpts → scale (zoom, eval=frame)`. The zoom uses duration-based strength, smootherstep easing, and multiplicative interpolation so higher FPS only improves smoothness instead of increasing zoom distance. The overlay x/y expressions use **float (sub-pixel) positioning** — no `round()` — so motion is continuous without stairstepping. The overlay expression anchors the zoom around the focal point at its neutral fitted-frame position, so smart focus reads as zooming into/out from the subject instead of sliding the foreground photo to center. Both paths always show the blurred background, preserving portrait photos in landscape output.
+- Both functions accept `use_lanczos: bool` (set by `build_render_command` when `quality_name` is `high`, `youtube`, or `max`). When true, `:flags=lanczos` is appended to all fg scale filters; the blurred bg scale is unaffected.
 
 **Clips** — `build_filter_for_clip()`:
 - Input via plain `-i` (no loop)
 - Filter chain: `scale (bg fill) → boxblur → overlay (fg) → [optional grade/vignette/grain per --clip-grade]`
 - No motion applied
+- Also accepts `use_lanczos` (same logic as stills)
 
 **Transitions** — `build_xfade_chain()`:
 - ffmpeg `xfade` filter chained between all items
-- Offset per transition = cumulative duration minus crossfade overlap
+- Transition offset per item = `_media_start_times(durations, xfade)[i]` — the shared timeline start of each item. This keeps xfade offset computation consistent with audio delay offsets.
 - `auto` mode rotates through `PRO_TRANSITIONS`
+
+**Rhythm pacing** — `build_photo_durations()`:
+- Per-shot durations vary via a sine wave over a **half-cycle** (0 → π) across the slideshow, creating one slow→fast→slow arc rather than a full oscillation. Jitter is layered on top for natural variation.
 
 **Location overlays** — pre-rendered to transparent PNGs, composited via `overlay=0:0` after the per-item filter.
 
@@ -169,15 +218,15 @@ python videophotoslide.py ./input_photos --split-secs 60 --dry-run
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -v
+python -m unittest tests/test_videophotoslide.py
 ```
 
-Test file: `tests/test_videophotoslide.py`. Uses `unittest` with mocking. Tests cover: metadata alignment after sorting, filename collision safety, transition validation, motion/parallax combinations, location overlay generation, rhythm calculations.
+Test file: `tests/test_videophotoslide.py`. Uses `unittest` with mocking. Tests cover: metadata alignment after sorting, filename collision safety, resolution target generation, YouTube bitrate selection, transition validation, motion/parallax combinations, location overlay generation, and rhythm calculations.
 
 When adding new features:
 - Add unit tests for any new pure functions
 - Sorting/reordering functions must test that `infos` stays aligned with `images`
-- Filename format changes must update the output name validation tests
+- Filename or output target changes must update the output name and resolution validation tests
 
 ---
 

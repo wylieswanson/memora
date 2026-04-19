@@ -7,21 +7,20 @@ The current version is slideshow-only and focuses on high-ROI visual polish:
 - gentle vignette
 - fine temporal grain
 - curated transition rotation
-- slight rhythm modulation for more editorial pacing
+- slight rhythm modulation for more editorial pacing (single arc: slow start, faster middle, slow end)
 
 ---
 
 ## What this produces
 
-From a directory of photos and/or video clips, the script renders one or both aspect ratios:
-- 16x9 landscape
-- 9x16 vertical
+From a directory of photos and/or video clips, the script renders one or both aspect ratios at the selected resolution:
 
-Available resolution presets:
-- `1080p`: 1920x1080 or 1080x1920
-- `1440p`: 2560x1440 or 1440x2560
-- `4k` / `2160p`: 3840x2160 or 2160x3840
-- `8k` / `4320p`: 7680x4320 or 4320x7680
+| Resolution | 16x9 output | 9x16 output | Notes |
+|---|---:|---:|---|
+| `1080p` | 1920x1080 | 1080x1920 | Default; fast and broadly compatible |
+| `1440p` | 2560x1440 | 1440x2560 | Sharper YouTube upload without huge files |
+| `4k` / `2160p` | 3840x2160 | 2160x3840 | Recommended practical maximum for YouTube |
+| `8k` / `4320p` | 7680x4320 | 4320x7680 | Experimental; slow renders and very large files |
 
 Output naming is deterministic and includes run identity fields:
 - Renders/<timestamp>_<input-folder>_fmt16x9_res<resolution>_q<quality>_transition-<transition>_n<photos>.mp4
@@ -77,6 +76,8 @@ Optional smart-focus dependency for subject-aware Ken Burns framing:
 pip install mediapipe
 ```
 
+`--smart-focus` uses MediaPipe Tasks. On first use, the script downloads the default Face Detector and Pose Landmarker model assets into `./.mediapipe_models`. Use the model override flags below if you want to pin or supply those assets manually.
+
 ---
 
 ## Usage
@@ -101,6 +102,8 @@ python videophotoslide.py ./input_photos
 | --format | both | 16x9, 9x16, or both |
 | --resolution | 1080p | 1080p, 1440p, 4k/2160p, or 8k/4320p |
 | --quality | standard | draft, standard, high, youtube, max |
+| --fps | quality preset | Override frames per second |
+| --bitrate | quality preset | Override output bitrate, e.g. 45M |
 | --sec | 2.8 | Base seconds per photo |
 | --xfade | 0.7 | Crossfade duration |
 | --transition | auto | Transition mode or explicit ffmpeg xfade transition |
@@ -108,7 +111,10 @@ python videophotoslide.py ./input_photos
 | --motion-style | none | none, kenburns, parallax, both |
 | --ken-burns-strength | auto | Override Ken Burns strength (0.0 to 0.03) |
 | --parallax-px | auto | Override parallax amplitude in pixels |
-| --smart-focus | off | Use MediaPipe face detection with pose fallback to bias Ken Burns framing |
+| --smart-focus | off | Use MediaPipe Tasks face detection with pose fallback to bias Ken Burns framing |
+| --smart-focus-model-dir | ./.mediapipe_models | Cache directory for MediaPipe Tasks model assets |
+| --smart-focus-face-model | auto | Path to a MediaPipe Face Detector model asset |
+| --smart-focus-pose-model | auto | Path to a MediaPipe Pose Landmarker model asset |
 | --sort-by | natural | natural, time, location, random |
 | --seed | 0 | Seed for sort and pacing variation |
 | --clip-grade | full | Visual treatment for video clips: none, grade (color only), full (grade+vignette+grain) |
@@ -127,6 +133,41 @@ python videophotoslide.py ./input_photos
 | --youtube-tags | empty | Comma-separated YouTube tags |
 | --youtube-category | 22 | YouTube category ID |
 | --youtube-privacy | private | private, public, unlisted |
+
+## Output targets and quality
+
+`--format` controls aspect ratio. `--resolution` controls pixel dimensions. `--quality` controls fps, background blur strength, and bitrate.
+
+For routine YouTube uploads, use:
+
+```bash
+python videophotoslide.py ./input_photos --format both --resolution 4k --quality youtube
+```
+
+Use `8k --quality max` only when you really want the largest supported render. It is useful as an archive or stress-test target, but it is usually overkill for normal slideshow uploads.
+
+Quality presets:
+
+| Quality | FPS | Bitrate behavior | Best use |
+|---|---:|---|---|
+| `draft` | 24 | `8M` | Fast preview; bicubic scaling |
+| `standard` | 30 | `15M` | Default balanced render; bicubic scaling |
+| `high` | 30 | `25M` | Better local/archive render; Lanczos scaling |
+| `youtube` | 30 | Resolution-aware YouTube SDR bitrate; high-frame-rate value when `--fps > 30` | Recommended YouTube upload; Lanczos scaling |
+| `max` | 30 | Highest SDR bitrate in the table below | Largest built-in upload preset; Lanczos scaling |
+
+The `youtube` and `max` presets use the SDR H.264 bitrate guidance from YouTube's recommended upload settings. The script keeps the output as MP4/H.264 with `+faststart`, AAC audio when audio is present, progressive frames, and 4:2:0 chroma via `yuv420p`.
+
+| Resolution | `youtube` at 24/25/30 fps | `youtube` at 48/50/60 fps | `max` |
+|---|---:|---:|---:|
+| `1080p` | `8M` | `12M` | `12M` |
+| `1440p` | `16M` | `24M` | `24M` |
+| `4k` | `45M` | `68M` | `68M` |
+| `8k` | `160M` | `240M` | `240M` |
+
+YouTube currently lists maximum upload size as 256 GB or 12 hours, whichever is less, for verified accounts. Check the official YouTube Help pages before very large batch renders because upload limits and encoding recommendations can change:
+- [Recommended upload encoding settings](https://support.google.com/youtube/answer/1722171)
+- [Upload videos longer than 15 minutes](https://support.google.com/youtube/answer/71673)
 
 Examples:
 
@@ -213,10 +254,16 @@ Then each shot receives:
 Transitions:
 - auto mode rotates through a restrained set for a modern professional flow.
 
+Ken Burns motion:
+- Sub-pixel overlay positioning gives smooth continuous motion with no stairstepping.
+- The zoom uses smooth ease-in/out (quintic Hermite curve) over each shot.
+- `--ken-burns-strength` controls the total zoom range per shot (0.0–0.03); default is auto-scaled to shot duration.
+
 Smart focus:
 - `--smart-focus` is a clean v1 subject-targeting mode for Ken Burns.
-- It uses MediaPipe face detection first, pose fallback second, and otherwise falls back to center framing.
+- It uses MediaPipe Tasks face detection first, pose landmark fallback second, and otherwise falls back to center framing.
 - It currently activates when `--motion-style` is `kenburns` or `both`.
+- Default model assets are cached in `./.mediapipe_models`; use `--smart-focus-face-model` and `--smart-focus-pose-model` for manually downloaded or alternate models.
 
 Sort modes:
 - `natural` (default): filename order.

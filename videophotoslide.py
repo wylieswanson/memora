@@ -5,6 +5,7 @@ A safer, cleaner slideshow generator derived from make_slideshow2.py.
 """
 
 import argparse
+import importlib
 import json
 import math
 import random
@@ -21,7 +22,7 @@ from datetime import datetime
 from functools import lru_cache
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -60,9 +61,9 @@ YOUTUBE_SDR_BITRATES = {
 
 MOTION_PRESETS = {
     "none": {"ken": 0.0, "parallax_ratio": 0.0, "description": "No extra motion"},
-    "kenburns": {"ken": 0.0015, "parallax_ratio": 0.0, "description": "Subtle linear zoom"},
+    "kenburns": {"ken": 0.0015, "parallax_ratio": 0.0, "description": "Subtle eased zoom"},
     "parallax": {"ken": 0.0, "parallax_ratio": 0.0028, "description": "Very subtle depth drift"},
-    "both": {"ken": 0.0015, "parallax_ratio": 0.0028, "description": "Subtle zoom plus depth drift"},
+    "both": {"ken": 0.0015, "parallax_ratio": 0.0028, "description": "Subtle eased zoom plus depth drift"},
 }
 
 # Curated transition set for modern, restrained motion language.
@@ -218,75 +219,250 @@ def progress_print(enabled: bool, message: str) -> None:
         print(message, flush=True)
 
 
-_MEDIAPIPE_FACE_DETECTOR = None
-_MEDIAPIPE_POSE_DETECTOR = None
+_MEDIAPIPE_FACE_DETECTOR: Optional[Any] = None
+_MEDIAPIPE_POSE_DETECTOR: Optional[Any] = None
+_MEDIAPIPE_FACE_MODEL_PATH: Optional[Path] = None
+_MEDIAPIPE_POSE_MODEL_PATH: Optional[Path] = None
+
+SMART_FOCUS_FACE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+)
+SMART_FOCUS_POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+)
+SMART_FOCUS_FACE_MODEL_NAME = "blaze_face_short_range.tflite"
+SMART_FOCUS_POSE_MODEL_NAME = "pose_landmarker_lite.task"
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def _get_mediapipe_detectors():
+def _ffmpeg_number(value: float) -> str:
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def _download_smart_focus_model(url: str, dest: Path, label: str, show_progress: bool = False) -> None:
+    ensure_dir(dest.parent)
+    tmp = dest.with_suffix(dest.suffix + ".download")
+    try:
+        progress_print(show_progress, f"[phase prep] downloading {label} model -> {dest}")
+        with urllib.request.urlopen(url, timeout=60) as response, tmp.open("wb") as fh:
+            shutil.copyfileobj(response, fh)
+        tmp.replace(dest)
+    except Exception as exc:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise SystemExit(
+            f"Smart focus could not download the {label} model from {url}. "
+            f"Download it manually and pass its path with the matching --smart-focus-*model flag."
+        ) from exc
+
+
+def _resolve_smart_focus_model(
+    explicit_path: Optional[str],
+    default_path: Path,
+    default_url: str,
+    label: str,
+    show_progress: bool = False,
+) -> Path:
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"--smart-focus-{label}-model file not found: {path}")
+        return path.resolve()
+
+    path = default_path.expanduser()
+    if not path.is_file():
+        _download_smart_focus_model(default_url, path, label, show_progress=show_progress)
+    return path.resolve()
+
+
+def resolve_smart_focus_model_paths(
+    model_dir: Path,
+    face_model: Optional[str] = None,
+    pose_model: Optional[str] = None,
+    show_progress: bool = False,
+) -> Tuple[Path, Path]:
+    face_path = _resolve_smart_focus_model(
+        face_model,
+        model_dir / SMART_FOCUS_FACE_MODEL_NAME,
+        SMART_FOCUS_FACE_MODEL_URL,
+        "face",
+        show_progress=show_progress,
+    )
+    pose_path = _resolve_smart_focus_model(
+        pose_model,
+        model_dir / SMART_FOCUS_POSE_MODEL_NAME,
+        SMART_FOCUS_POSE_MODEL_URL,
+        "pose",
+        show_progress=show_progress,
+    )
+    return face_path, pose_path
+
+
+def configure_smart_focus_models(face_model_path: Path, pose_model_path: Path) -> None:
+    global _MEDIAPIPE_FACE_MODEL_PATH, _MEDIAPIPE_POSE_MODEL_PATH
+    global _MEDIAPIPE_FACE_DETECTOR, _MEDIAPIPE_POSE_DETECTOR
+
+    face_model_path = face_model_path.expanduser().resolve()
+    pose_model_path = pose_model_path.expanduser().resolve()
+    if (_MEDIAPIPE_FACE_MODEL_PATH, _MEDIAPIPE_POSE_MODEL_PATH) != (face_model_path, pose_model_path):
+        _MEDIAPIPE_FACE_DETECTOR = None
+        _MEDIAPIPE_POSE_DETECTOR = None
+    _MEDIAPIPE_FACE_MODEL_PATH = face_model_path
+    _MEDIAPIPE_POSE_MODEL_PATH = pose_model_path
+
+
+def _get_configured_smart_focus_models() -> Tuple[Path, Path]:
+    if _MEDIAPIPE_FACE_MODEL_PATH is None or _MEDIAPIPE_POSE_MODEL_PATH is None:
+        raise SystemExit(
+            "Smart focus requires MediaPipe Tasks model assets. "
+            "Run through main() so models can be resolved, or call configure_smart_focus_models() first."
+        )
+    return _MEDIAPIPE_FACE_MODEL_PATH, _MEDIAPIPE_POSE_MODEL_PATH
+
+
+def _get_mediapipe_task_modules() -> Tuple[Any, Any, Any]:
+    try:
+        mp = importlib.import_module("mediapipe")
+        mp_python = importlib.import_module("mediapipe.tasks.python")
+        vision = importlib.import_module("mediapipe.tasks.python.vision")
+    except ImportError as exc:
+        raise SystemExit(
+            "Smart focus requires MediaPipe Tasks. Install: pip install mediapipe"
+        ) from exc
+    return mp, mp_python, vision
+
+
+def _get_mediapipe_detectors() -> Tuple[Any, Any]:
     global _MEDIAPIPE_FACE_DETECTOR, _MEDIAPIPE_POSE_DETECTOR
 
     if _MEDIAPIPE_FACE_DETECTOR is not None and _MEDIAPIPE_POSE_DETECTOR is not None:
         return _MEDIAPIPE_FACE_DETECTOR, _MEDIAPIPE_POSE_DETECTOR
 
-    try:
-        import mediapipe as mp
-    except ImportError as exc:
-        raise SystemExit(
-            "Smart focus requires MediaPipe. Install: pip install mediapipe"
-        ) from exc
+    face_model_path, pose_model_path = _get_configured_smart_focus_models()
+    _mp, mp_python, vision = _get_mediapipe_task_modules()
+    base_options = mp_python.BaseOptions
 
-    if _MEDIAPIPE_FACE_DETECTOR is None:
-        _MEDIAPIPE_FACE_DETECTOR = mp.solutions.face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.5,
-        )
-    if _MEDIAPIPE_POSE_DETECTOR is None:
-        _MEDIAPIPE_POSE_DETECTOR = mp.solutions.pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-        )
+    try:
+        if _MEDIAPIPE_FACE_DETECTOR is None:
+            face_options = vision.FaceDetectorOptions(
+                base_options=base_options(model_asset_path=str(face_model_path)),
+                running_mode=vision.RunningMode.IMAGE,
+                min_detection_confidence=0.5,
+            )
+            _MEDIAPIPE_FACE_DETECTOR = vision.FaceDetector.create_from_options(face_options)
+        if _MEDIAPIPE_POSE_DETECTOR is None:
+            pose_options = vision.PoseLandmarkerOptions(
+                base_options=base_options(model_asset_path=str(pose_model_path)),
+                running_mode=vision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_segmentation_masks=False,
+            )
+            _MEDIAPIPE_POSE_DETECTOR = vision.PoseLandmarker.create_from_options(pose_options)
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(f"Smart focus could not initialize MediaPipe Tasks: {exc}") from exc
+
     return _MEDIAPIPE_FACE_DETECTOR, _MEDIAPIPE_POSE_DETECTOR
+
+
+def _pil_to_mediapipe_image(image: Image.Image) -> Any:
+    mp, _mp_python, _vision = _get_mediapipe_task_modules()
+    image_rgb = np.asarray(image.convert("RGB"))
+    return mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+
+
+def _focus_from_face_result(face_result: Any, width: int, height: int) -> Optional[Tuple[float, float]]:
+    detections = getattr(face_result, "detections", None) or []
+    if not detections:
+        return None
+
+    def detection_score(detection: Any) -> float:
+        categories = getattr(detection, "categories", None) or []
+        scores = [getattr(category, "score", 0.0) or 0.0 for category in categories]
+        return max(scores) if scores else 0.0
+
+    best = max(detections, key=detection_score)
+    keypoints = getattr(best, "keypoints", None) or []
+    for keypoint in keypoints:
+        label = (getattr(keypoint, "label", "") or "").lower()
+        x = getattr(keypoint, "x", None)
+        y = getattr(keypoint, "y", None)
+        if "nose" in label and x is not None and y is not None:
+            return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
+
+    bbox = getattr(best, "bounding_box", None)
+    if bbox is None or width <= 0 or height <= 0:
+        return None
+    face_x = (bbox.origin_x + (bbox.width / 2.0)) / width
+    face_y = (bbox.origin_y + (bbox.height * 0.38)) / height
+    return clamp(face_x, 0.0, 1.0), clamp(face_y, 0.0, 1.0)
+
+
+def _landmark_is_usable(landmark: Any) -> bool:
+    if getattr(landmark, "x", None) is None or getattr(landmark, "y", None) is None:
+        return False
+    visibility = getattr(landmark, "visibility", None)
+    presence = getattr(landmark, "presence", None)
+    if visibility is not None and visibility < 0.5:
+        return False
+    if presence is not None and presence < 0.5:
+        return False
+    return True
+
+
+def _focus_from_pose_result(pose_result: Any) -> Optional[Tuple[float, float]]:
+    poses = getattr(pose_result, "pose_landmarks", None) or []
+    if not poses:
+        return None
+
+    landmarks = poses[0]
+    visible = [lm for lm in landmarks if _landmark_is_usable(lm)]
+    if not visible:
+        return None
+
+    nose = landmarks[0] if landmarks else None
+    if nose is not None and _landmark_is_usable(nose):
+        return clamp(nose.x, 0.0, 1.0), clamp(nose.y, 0.0, 1.0)
+
+    shoulder_ids = (11, 12)
+    shoulders = [
+        landmarks[idx]
+        for idx in shoulder_ids
+        if idx < len(landmarks) and _landmark_is_usable(landmarks[idx])
+    ]
+    if shoulders:
+        x = sum(lm.x for lm in shoulders) / len(shoulders)
+        y = sum(lm.y for lm in shoulders) / len(shoulders)
+        return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
+
+    x = sum(lm.x for lm in visible) / len(visible)
+    y = sum(lm.y for lm in visible) / len(visible)
+    return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
 
 
 def detect_subject_focus(image: Image.Image) -> Optional[Tuple[float, float]]:
     face_detector, pose_detector = _get_mediapipe_detectors()
-    image_rgb = np.asarray(image.convert("RGB"))
+    mp_image = _pil_to_mediapipe_image(image)
 
-    face_result = face_detector.process(image_rgb)
-    if face_result.detections:
-        best = max(face_result.detections, key=lambda det: det.score[0] if det.score else 0.0)
-        bbox = best.location_data.relative_bounding_box
-        face_x = bbox.xmin + (bbox.width / 2.0)
-        face_y = bbox.ymin + (bbox.height * 0.38)
-        return clamp(face_x, 0.0, 1.0), clamp(face_y, 0.0, 1.0)
+    face_focus = _focus_from_face_result(
+        face_detector.detect(mp_image),
+        width=image.width,
+        height=image.height,
+    )
+    if face_focus is not None:
+        return face_focus
 
-    pose_result = pose_detector.process(image_rgb)
-    if pose_result.pose_landmarks:
-        landmarks = pose_result.pose_landmarks.landmark
-        visible = [lm for lm in landmarks if getattr(lm, "visibility", 0.0) >= 0.5]
-        if visible:
-            nose = landmarks[0]
-            if getattr(nose, "visibility", 0.0) >= 0.5:
-                return clamp(nose.x, 0.0, 1.0), clamp(nose.y, 0.0, 1.0)
-
-            shoulder_ids = (11, 12)
-            shoulders = [landmarks[idx] for idx in shoulder_ids if getattr(landmarks[idx], "visibility", 0.0) >= 0.5]
-            if shoulders:
-                x = sum(lm.x for lm in shoulders) / len(shoulders)
-                y = sum(lm.y for lm in shoulders) / len(shoulders)
-                return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
-
-            x = sum(lm.x for lm in visible) / len(visible)
-            y = sum(lm.y for lm in visible) / len(visible)
-            return clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
-
-    return None
+    return _focus_from_pose_result(pose_detector.detect(mp_image))
 
 
 def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
@@ -297,6 +473,10 @@ def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip().splitlines()[-1] if result.stderr else "no details"
+            print(f"Skipping video (ffprobe exit {result.returncode}): {path.name} — {detail}", file=sys.stderr)
+            return None
         data = json.loads(result.stdout)
     except Exception as e:
         print(f"Skipping video (probe failed): {path.name} — {e}", file=sys.stderr)
@@ -443,7 +623,7 @@ def build_photo_durations(
     durations = []
     for i in range(num_photos):
         # Smoothly varying cadence avoids abrupt timing jumps between adjacent shots.
-        wave = 0.5 * (1.0 + math.sin((i / max(1, num_photos - 1)) * math.pi * 2.0))
+        wave = 0.5 * (1.0 + math.sin((i / max(1, num_photos - 1)) * math.pi))
         jitter = (rng.random() - 0.5) * 0.8
         delta = ((wave - 0.5) + jitter) * strength
         sec = base_sec * (1.0 + delta)
@@ -642,7 +822,9 @@ def _convert_single_image(args_tuple):
         return idx, None, None, f"{src.name}: {e}"
 
 
-def _init_mediapipe_worker():
+def _init_mediapipe_worker(face_model_path: Optional[str] = None, pose_model_path: Optional[str] = None):
+    if face_model_path and pose_model_path:
+        configure_smart_focus_models(Path(face_model_path), Path(pose_model_path))
     _get_mediapipe_detectors()
 
 
@@ -651,6 +833,7 @@ def convert_to_pngs(
     work_dir: Path,
     extract_exif: bool = True,
     detect_focus: bool = False,
+    smart_focus_models: Optional[Tuple[Path, Path]] = None,
     max_workers: int = 0,
     show_progress: bool = False,
 ) -> Tuple[List[Path], List[Optional[PhotoInfo]], dict]:
@@ -670,6 +853,11 @@ def convert_to_pngs(
     progress_every = 1 if len(image_files) <= 10 else 5
     progress_label = "convert+focus" if detect_focus else "convert"
 
+    if detect_focus:
+        if smart_focus_models is None:
+            smart_focus_models = _get_configured_smart_focus_models()
+        configure_smart_focus_models(*smart_focus_models)
+
     def emit_progress(processed_count: int, focus_hits: int) -> None:
         if not show_progress:
             return
@@ -688,7 +876,8 @@ def convert_to_pngs(
         auto_workers = min(len(image_files), max(2, min(cpu_count(), 6)))
         workers = auto_workers if max_workers <= 0 else max(1, min(len(image_files), max_workers))
         initializer = _init_mediapipe_worker if detect_focus else None
-        with Pool(workers, initializer=initializer) as pool:
+        initargs = tuple(str(p) for p in smart_focus_models) if detect_focus else ()
+        with Pool(workers, initializer=initializer, initargs=initargs) as pool:
             processed = 0
             focus_hits = 0
             results = []
@@ -726,6 +915,7 @@ def collect_media(
     work_dir: Path,
     extract_exif: bool = True,
     detect_focus: bool = False,
+    smart_focus_models: Optional[Tuple[Path, Path]] = None,
     max_workers: int = 0,
     show_progress: bool = False,
 ) -> Tuple[List[Path], List[Optional[PhotoInfo]]]:
@@ -752,6 +942,7 @@ def collect_media(
             input_dir, work_dir,
             extract_exif=extract_exif,
             detect_focus=detect_focus,
+            smart_focus_models=smart_focus_models,
             max_workers=max_workers,
             show_progress=show_progress,
         )
@@ -876,28 +1067,32 @@ def build_filter_for_still(
     parallax_px: int = 0,
     motion_seed: int = 0,
     focal_point: Optional[Tuple[float, float]] = None,
+    use_lanczos: bool = False,
 ) -> str:
     local_rng = random.Random(motion_seed + i * 101)
+    scale_flags = ":flags=lanczos" if use_lanczos else ""
 
     u = f"(t/{sec})"
     smooth_u = f"min(max({u},0),1)"
-    ease = f"(3*pow({smooth_u},2)-2*pow({smooth_u},3))"
+    ease = f"(6*pow({smooth_u},5)-15*pow({smooth_u},4)+10*pow({smooth_u},3))"
     if ken_strength > 0:
-        focus_x = focal_point[0] if focal_point else 0.5
-        focus_y = focal_point[1] if focal_point else 0.5
-
         has_subject_target = focal_point is not None
-        base_zoom = 1.0 + (ken_strength * 0.45)
-        end_zoom = 1.0 + (ken_strength * (1.25 if has_subject_target else 0.85))
-        drift_norm_x = local_rng.uniform(-0.045, 0.045) if has_subject_target else local_rng.uniform(-0.02, 0.02)
-        drift_norm_y = local_rng.uniform(-0.03, 0.03) if has_subject_target else local_rng.uniform(-0.015, 0.015)
-        if parallax_px > 0:
-            drift_norm_x += local_rng.choice([-1, 1]) * ((parallax_px * 0.35) / max(width, 1))
-            drift_norm_y += local_rng.choice([-1, 1]) * ((parallax_px * 0.35) / max(height, 1))
-        start_fx = clamp(focus_x - (drift_norm_x * 0.5), 0.18, 0.82)
-        end_fx = clamp(focus_x + (drift_norm_x * 0.5), 0.18, 0.82)
-        start_fy = clamp(focus_y - (drift_norm_y * 0.5), 0.18, 0.82)
-        end_fy = clamp(focus_y + (drift_norm_y * 0.5), 0.18, 0.82)
+        focus_x = clamp(focal_point[0], 0.05, 0.95) if focal_point else 0.5
+        focus_y = clamp(focal_point[1], 0.05, 0.95) if focal_point else 0.5
+
+        # Convert strength into an across-shot zoom delta, independent of fps.
+        # Higher frame rates should feel smoother, not more aggressive.
+        zoom_delta = clamp(ken_strength * sec * 18.0, 0.0, 0.18)
+        if not has_subject_target:
+            zoom_delta *= 0.75
+        zoom_in = local_rng.random() >= 0.5
+        start_zoom = 1.0 if zoom_in else 1.0 + zoom_delta
+        end_zoom = 1.0 + zoom_delta if zoom_in else 1.0
+        start_zoom_s = _ffmpeg_number(start_zoom)
+        end_zoom_s = _ffmpeg_number(end_zoom)
+        focus_x_s = _ffmpeg_number(focus_x)
+        focus_y_s = _ffmpeg_number(focus_y)
+        zoom = f"({start_zoom_s}*pow(({end_zoom_s}/{start_zoom_s}),{ease}))"
 
         # Background: blurred fill, same as the no-motion path — ensures portrait photos
         # in landscape output (and any other aspect mismatch) always have a blurred backdrop.
@@ -906,17 +1101,19 @@ def build_filter_for_still(
             f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
             f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
         )
-        # Foreground: fit to frame (decrease), then animate the Ken Burns zoom per-frame.
+        # Foreground: first normalize cadence for the still, then animate zoom
+        # so ffmpeg evaluates motion on the exact output frame timeline.
         fg = (
-            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,"
-            f"scale=w='iw*({base_zoom}+(({end_zoom}-{base_zoom})*{ease}))':"
-            f"h='ih*({base_zoom}+(({end_zoom}-{base_zoom})*{ease}))':eval=frame,"
-            f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
+            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},setsar=1,"
+            f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS,"
+            f"scale=w='iw*{zoom}':h='ih*{zoom}':eval=frame{scale_flags},"
+            f"setsar=1[fg{i}]"
         )
-        # Overlay: pan from start to end focal position via ease.
-        # w/h in the overlay expression are the current-frame FG dimensions (varies with zoom).
-        pan_x = f"round({width}/2)-(({start_fx}+({end_fx}-{start_fx})*{ease})*w)"
-        pan_y = f"round({height}/2)-(({start_fy}+({end_fy}-{start_fy})*{ease})*h)"
+        # Overlay: keep the chosen focal point anchored at its neutral fitted-frame
+        # position while the foreground zooms. This reads as zooming into/out from
+        # the subject instead of sliding the entire photo across the background.
+        pan_x = f"(({width}-(w/{zoom}))/2)+({focus_x_s}*(w/{zoom}))-({focus_x_s}*w)"
+        pan_y = f"(({height}-(h/{zoom}))/2)+({focus_y_s}*(h/{zoom}))-({focus_y_s}*h)"
         comp = (
             f"[bg{i}][fg{i}]overlay=x='{pan_x}':y='{pan_y}',"
             "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
@@ -931,7 +1128,7 @@ def build_filter_for_still(
         f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
         f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
     )
-    fg = f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
+    fg = f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},setsar=1,fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
     if parallax_px > 0:
         parallax_drift = f"{local_rng.choice([-1, 1]) * parallax_px}*({ease}-0.5)"
         overlay = f"overlay=x='(W-w)/2+({parallax_drift})':y='(H-h)/2'"
@@ -956,15 +1153,17 @@ def build_filter_for_clip(
     duration: float,
     blur_strength: int = 18,
     clip_grade: str = "full",
+    use_lanczos: bool = False,
 ) -> str:
     """Build ffmpeg filter chain for a video clip. No still-image looping, no motion applied."""
+    scale_flags = ":flags=lanczos" if use_lanczos else ""
     bg = (
         f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
         f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
         f"fps={fps},trim=duration={duration:.3f},setpts=PTS-STARTPTS[bg{i}]"
     )
     fg = (
-        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1,"
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},setsar=1,"
         f"fps={fps},trim=duration={duration:.3f},setpts=PTS-STARTPTS[fg{i}]"
     )
     overlay = "overlay=(W-w)/2:(H-h)/2"
@@ -989,26 +1188,24 @@ def build_filter_for_clip(
 
 def build_xfade_chain(
     photo_durations: List[float],
-    xfade,
-    transition="auto",
+    xfade: float,
+    transition: str = "auto",
     stream_names: Optional[List[str]] = None,
 ):
     n = len(photo_durations)
     names = stream_names if stream_names is not None else [f"[v{i}]" for i in range(n)]
     if n == 1:
         return f"{names[0]}format=yuv420p[vout]"
+    starts = _media_start_times(photo_durations, xfade)
     parts = []
     cur = names[0]
-    cumulative = photo_durations[0]
     for i in range(1, n):
-        offset = cumulative - (i * xfade)
         out = f"[x{i}]"
         resolved_transition = resolve_transition_name(transition, i)
         parts.append(
-            f"{cur}{names[i]}xfade=transition={resolved_transition}:duration={xfade}:offset={offset}{out}"
+            f"{cur}{names[i]}xfade=transition={resolved_transition}:duration={xfade}:offset={starts[i]}{out}"
         )
         cur = out
-        cumulative += photo_durations[i]
     total = estimate_duration_variable(photo_durations, xfade)
     parts.append(f"{cur}trim=duration={total},format=yuv420p[vout]")
     return ";\n".join(parts)
@@ -1163,15 +1360,17 @@ def build_render_command(
                 next_idx += 1
 
     # Per-item video filters: clips skip motion; photos get full still treatment.
+    use_lanczos = cfg.quality_name in ("high", "youtube", "max")
     filters = []
     for i, (item_dur, info) in enumerate(zip(media_durations, infos_list)):
         if info and info.is_video:
-            filters.append(build_filter_for_clip(i, width, height, cfg.fps, item_dur, cfg.blur_strength, cfg.clip_grade))
+            filters.append(build_filter_for_clip(i, width, height, cfg.fps, item_dur, cfg.blur_strength, cfg.clip_grade, use_lanczos))
         else:
             filters.append(build_filter_for_still(
                 i, width, height, cfg.fps, item_dur,
                 cfg.blur_strength, ken, para, cfg.motion_seed,
                 focal_points[i] if focal_points else None,
+                use_lanczos,
             ))
 
     # Label overlays: composite label PNG onto each labeled stream.
@@ -1383,7 +1582,13 @@ def parse_args():
     ap.add_argument("--ken-burns-strength", type=float, default=None)
     ap.add_argument("--parallax-px", type=int, default=None)
     ap.add_argument("--smart-focus", action="store_true",
-                    help="Use MediaPipe face detection with pose fallback to bias Ken Burns framing")
+                    help="Use MediaPipe Tasks face detection with pose fallback to bias Ken Burns framing")
+    ap.add_argument("--smart-focus-model-dir", default="./.mediapipe_models",
+                    help="Directory for cached MediaPipe Tasks model assets")
+    ap.add_argument("--smart-focus-face-model", default=None,
+                    help="Path to a MediaPipe Face Detector model asset")
+    ap.add_argument("--smart-focus-pose-model", default=None,
+                    help="Path to a MediaPipe Pose Landmarker model asset")
     ap.add_argument("--progress", action="store_true",
                     help="Show progress updates during preparation and rendering")
     ap.add_argument("--sec", type=float, default=2.8)
@@ -1833,6 +2038,10 @@ def _validate_args(args) -> None:
         raise SystemExit("--ken-burns-strength must be between 0.0 and 0.03")
     if args.parallax_px is not None and args.parallax_px < 0:
         raise SystemExit("--parallax-px must be >= 0")
+    if getattr(args, "smart_focus_face_model", None) and not Path(args.smart_focus_face_model).expanduser().is_file():
+        raise SystemExit(f"--smart-focus-face-model file not found: {args.smart_focus_face_model}")
+    if getattr(args, "smart_focus_pose_model", None) and not Path(args.smart_focus_pose_model).expanduser().is_file():
+        raise SystemExit(f"--smart-focus-pose-model file not found: {args.smart_focus_pose_model}")
     if not (0.0 <= args.rhythm_strength <= 0.25):
         raise SystemExit("--rhythm-strength must be between 0.0 and 0.25")
     if should_upload and not args.youtube_category.isdigit():
@@ -1982,6 +2191,18 @@ def main():
         detect_focus = args.smart_focus and args.motion_style in ("kenburns", "both")
         if args.smart_focus and not detect_focus:
             print(f"Warning: --smart-focus has no effect with --motion-style {args.motion_style}; use kenburns or both", file=sys.stderr)
+        smart_focus_models = None
+        if detect_focus:
+            smart_focus_model_dir = getattr(args, "smart_focus_model_dir", "./.mediapipe_models")
+            smart_focus_face_model = getattr(args, "smart_focus_face_model", None)
+            smart_focus_pose_model = getattr(args, "smart_focus_pose_model", None)
+            smart_focus_models = resolve_smart_focus_model_paths(
+                Path(smart_focus_model_dir),
+                face_model=smart_focus_face_model,
+                pose_model=smart_focus_pose_model,
+                show_progress=args.progress,
+            )
+            configure_smart_focus_models(*smart_focus_models)
         progress_print(args.progress, f"[phase prep] scanning {src}")
         if detect_focus:
             progress_print(args.progress, "[phase prep] initializing smart focus detectors")
@@ -1991,6 +2212,7 @@ def main():
             temp_work,
             extract_exif=extract_exif,
             detect_focus=detect_focus,
+            smart_focus_models=smart_focus_models,
             max_workers=args.max_workers,
             show_progress=args.progress,
         )

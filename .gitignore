@@ -1,6 +1,7 @@
 .DS_Store
 tests/.DS_Store
 .youtube_token.json
+.mediapipe_models/
 Photos/
 Renders/
 __pycache__/

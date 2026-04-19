@@ -38,6 +38,9 @@ def _make_args(**overrides):
         ken_burns_strength=None,
         parallax_px=None,
         smart_focus=False,
+        smart_focus_model_dir="./.mediapipe_models",
+        smart_focus_face_model=None,
+        smart_focus_pose_model=None,
         progress=False,
         sec=2.8,
         xfade=0.7,
@@ -260,6 +263,113 @@ class VideoPhotoSlideTests(unittest.TestCase):
                 vps.parse_args()
 
     # -----------------------------------------------------------------------
+    # MediaPipe smart focus
+    # -----------------------------------------------------------------------
+
+    def test_get_mediapipe_detectors_loads_task_modules(self):
+        face_detector = object()
+        pose_detector = object()
+        mp_module = SimpleNamespace()
+        base_options = MagicMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+        mp_python_module = SimpleNamespace(BaseOptions=base_options)
+        vision_module = SimpleNamespace(
+            RunningMode=SimpleNamespace(IMAGE="image"),
+            FaceDetectorOptions=MagicMock(return_value="face-options"),
+            PoseLandmarkerOptions=MagicMock(return_value="pose-options"),
+            FaceDetector=SimpleNamespace(create_from_options=MagicMock(return_value=face_detector)),
+            PoseLandmarker=SimpleNamespace(create_from_options=MagicMock(return_value=pose_detector)),
+        )
+
+        def fake_import_module(name):
+            if name == "mediapipe":
+                return mp_module
+            if name == "mediapipe.tasks.python":
+                return mp_python_module
+            if name == "mediapipe.tasks.python.vision":
+                return vision_module
+            raise ModuleNotFoundError(name)
+
+        with TemporaryDirectory() as tmp:
+            face_model = Path(tmp) / "face.tflite"
+            pose_model = Path(tmp) / "pose.task"
+            face_model.write_bytes(b"face")
+            pose_model.write_bytes(b"pose")
+
+            old_face_detector = vps._MEDIAPIPE_FACE_DETECTOR
+            old_pose_detector = vps._MEDIAPIPE_POSE_DETECTOR
+            old_face_model = vps._MEDIAPIPE_FACE_MODEL_PATH
+            old_pose_model = vps._MEDIAPIPE_POSE_MODEL_PATH
+            try:
+                vps.configure_smart_focus_models(face_model, pose_model)
+                with patch("videophotoslide.importlib.import_module", side_effect=fake_import_module):
+                    self.assertEqual(vps._get_mediapipe_detectors(), (face_detector, pose_detector))
+            finally:
+                vps._MEDIAPIPE_FACE_DETECTOR = old_face_detector
+                vps._MEDIAPIPE_POSE_DETECTOR = old_pose_detector
+                vps._MEDIAPIPE_FACE_MODEL_PATH = old_face_model
+                vps._MEDIAPIPE_POSE_MODEL_PATH = old_pose_model
+
+        self.assertEqual(vision_module.FaceDetector.create_from_options.call_args.args[0], "face-options")
+        self.assertEqual(vision_module.PoseLandmarker.create_from_options.call_args.args[0], "pose-options")
+
+    def test_get_mediapipe_detectors_reports_missing_tasks_api(self):
+        old_face_detector = vps._MEDIAPIPE_FACE_DETECTOR
+        old_pose_detector = vps._MEDIAPIPE_POSE_DETECTOR
+        old_face_model = vps._MEDIAPIPE_FACE_MODEL_PATH
+        old_pose_model = vps._MEDIAPIPE_POSE_MODEL_PATH
+        with TemporaryDirectory() as tmp:
+            face_model = Path(tmp) / "face.tflite"
+            pose_model = Path(tmp) / "pose.task"
+            face_model.write_bytes(b"face")
+            pose_model.write_bytes(b"pose")
+            try:
+                vps.configure_smart_focus_models(face_model, pose_model)
+                with patch("videophotoslide.importlib.import_module", side_effect=ModuleNotFoundError("mediapipe")):
+                    with self.assertRaises(SystemExit) as ctx:
+                        vps._get_mediapipe_detectors()
+            finally:
+                vps._MEDIAPIPE_FACE_DETECTOR = old_face_detector
+                vps._MEDIAPIPE_POSE_DETECTOR = old_pose_detector
+                vps._MEDIAPIPE_FACE_MODEL_PATH = old_face_model
+                vps._MEDIAPIPE_POSE_MODEL_PATH = old_pose_model
+
+        self.assertIn("MediaPipe Tasks", str(ctx.exception))
+
+    def test_smart_focus_parses_tasks_face_detection_result(self):
+        detection = SimpleNamespace(
+            categories=[SimpleNamespace(score=0.9)],
+            keypoints=[],
+            bounding_box=SimpleNamespace(origin_x=100, origin_y=80, width=200, height=100),
+        )
+        focus = vps._focus_from_face_result(SimpleNamespace(detections=[detection]), width=1000, height=500)
+        self.assertEqual(focus, (0.2, 0.236))
+
+    def test_smart_focus_parses_tasks_pose_result(self):
+        hidden_nose = SimpleNamespace(x=0.1, y=0.2, visibility=0.1, presence=1.0)
+        landmarks = [hidden_nose] + [SimpleNamespace(x=0.0, y=0.0, visibility=0.1, presence=1.0) for _ in range(10)]
+        landmarks += [
+            SimpleNamespace(x=0.4, y=0.3, visibility=0.9, presence=1.0),
+            SimpleNamespace(x=0.6, y=0.5, visibility=0.9, presence=1.0),
+        ]
+        focus = vps._focus_from_pose_result(SimpleNamespace(pose_landmarks=[landmarks]))
+        self.assertEqual(focus, (0.5, 0.4))
+
+    def test_resolve_smart_focus_model_paths_uses_explicit_files(self):
+        with TemporaryDirectory() as tmp:
+            face_model = Path(tmp) / "face.tflite"
+            pose_model = Path(tmp) / "pose.task"
+            face_model.write_bytes(b"face")
+            pose_model.write_bytes(b"pose")
+
+            resolved = vps.resolve_smart_focus_model_paths(
+                Path(tmp) / "cache",
+                face_model=str(face_model),
+                pose_model=str(pose_model),
+            )
+
+        self.assertEqual(resolved, (face_model.resolve(), pose_model.resolve()))
+
+    # -----------------------------------------------------------------------
     # Motion
     # -----------------------------------------------------------------------
 
@@ -360,12 +470,19 @@ class VideoPhotoSlideTests(unittest.TestCase):
         # Foreground: fit (decrease) with per-frame zoom
         self.assertIn("force_original_aspect_ratio=decrease", filt)
         self.assertIn("eval=frame", filt)
-        # Overlay with animated focal-point pan
+        self.assertIn("setsar=1,fps=30,trim=duration=2.8,setpts=PTS-STARTPTS,scale=w='iw*", filt)
+        # Overlay anchors the zoom around the detected focal point instead of
+        # translating the subject directly to frame center.
         self.assertIn("overlay=x=", filt)
-        self.assertIn("round(1920/2)", filt)
-        self.assertIn("round(1080/2)", filt)
-        # Ease function drives both zoom and pan
-        self.assertIn("3*pow(min(max((t/2.8),0),1),2)-2*pow(min(max((t/2.8),0),1),3)", filt)
+        self.assertIn("(0.25*(w/(", filt)
+        self.assertIn("-(0.25*w)", filt)
+        self.assertIn("(0.4*(h/(", filt)
+        self.assertIn("-(0.4*h)", filt)
+        self.assertNotIn("round(1920/2)-", filt)
+        self.assertIn("1.0756", filt)
+        self.assertIn("*pow((1.0756/1),", filt)
+        # Smootherstep easing drives the zoom.
+        self.assertIn("6*pow(min(max((t/2.8),0),1),5)-15*pow(min(max((t/2.8),0),1),4)+10*pow(min(max((t/2.8),0),1),3)", filt)
         # No hard crop step on FG
         self.assertNotIn(":x='", filt)
 
@@ -846,6 +963,9 @@ class VideoPhotoSlideTests(unittest.TestCase):
             stream = StringIO()
             with patch("videophotoslide.parse_args", return_value=args), \
                  patch("videophotoslide.collect_media", return_value=(images, infos)) as mock_collect, \
+                 patch("videophotoslide.resolve_smart_focus_model_paths",
+                       return_value=(Path(tmp) / "face.tflite", Path(tmp) / "pose.task")) as mock_models, \
+                 patch("videophotoslide.configure_smart_focus_models") as mock_configure, \
                  patch("videophotoslide.sort_images_and_infos", return_value=(images, infos)), \
                  patch("videophotoslide.ffmpeg_has_encoder", return_value=False), \
                  patch("videophotoslide.datetime") as mock_datetime, \
@@ -862,6 +982,9 @@ class VideoPhotoSlideTests(unittest.TestCase):
                 vps.main()
 
         self.assertTrue(mock_collect.call_args.kwargs["detect_focus"])
+        self.assertEqual(mock_collect.call_args.kwargs["smart_focus_models"], (Path(tmp) / "face.tflite", Path(tmp) / "pose.task"))
+        mock_models.assert_called_once()
+        mock_configure.assert_called_once_with(Path(tmp) / "face.tflite", Path(tmp) / "pose.task")
         self.assertEqual(mock_render.call_args.kwargs["focal_points"], [(0.3, 0.4)])
 
     def test_main_prints_prep_progress_when_enabled(self):
