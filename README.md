@@ -108,6 +108,7 @@ memoramotion ./input_photos
 | --rhythm-strength | 0.12 | Pacing variation strength (0.0 to 0.25) |
 | --motion-style | none | none, kenburns, parallax, both |
 | --ken-burns-strength | auto | Override Ken Burns strength (0.0 to 0.03) |
+| --ken-burns-engine | auto | auto uses fit-overlay normally and fixed-viewport with --smart-focus; explicit: fit-overlay, preserve-stage, fixed-viewport |
 | --parallax-px | auto | Override parallax amplitude in pixels |
 | --smart-focus | off | Use MediaPipe Tasks face detection with pose fallback to bias Ken Burns framing |
 | --smart-focus-model-dir | ./.mediapipe_models | Cache directory for MediaPipe Tasks model assets |
@@ -191,6 +192,12 @@ memoramotion ./input_photos --format 16x9 --resolution 8k --quality max
 # Ken Burns with subject-aware framing
 memoramotion ./input_photos --motion-style kenburns --smart-focus
 
+# Stable-foreground Ken Burns is automatic with smart focus
+memoramotion ./input_photos --motion-style kenburns --smart-focus --ken-burns-engine fixed-viewport
+
+# Full-photo-preserving Ken Burns comparison mode
+memoramotion ./input_photos --motion-style kenburns --smart-focus --ken-burns-engine preserve-stage
+
 # Render and upload to YouTube as private
 memoramotion ./input_photos \
   --format 16x9 \
@@ -253,9 +260,12 @@ Transitions:
 - auto mode rotates through a restrained set for a modern professional flow.
 
 Ken Burns motion:
-- Sub-pixel overlay positioning gives smooth continuous motion with no stairstepping.
-- The zoom uses smooth ease-in/out (quintic Hermite curve) over each shot.
+- `fit-overlay` is the default engine. It fits the foreground photo over the blurred background, animates an eased zoom, and gently biases the zoom anchor toward the smart-focus point.
+- `preserve-stage` builds a transparent full-frame stage, keeps the whole photo visible with a small safety margin, animates that stage with FFmpeg `zoompan`, then composites it over the blurred background at `0:0`. This preserves the photo, but the visible foreground footprint may subtly resize.
+- `fixed-viewport` keeps the foreground photo footprint fixed and zooms/pans the image content inside it. This is usually the cleanest smart-focus Ken Burns look, but it can crop during the zoom because the outer photo bounds do not move.
+- All Ken Burns engines use smooth ease-in/out (quintic Hermite curve) over each shot.
 - `--ken-burns-strength` controls the total zoom range per shot (0.0–0.03); default is auto-scaled to shot duration.
+- When `--smart-focus` is active with Ken Burns motion and no engine is specified, Memora Motion automatically uses `fixed-viewport`. Explicit `--ken-burns-engine` values always win.
 
 Smart focus:
 - `--smart-focus` is a clean v1 subject-targeting mode for Ken Burns.

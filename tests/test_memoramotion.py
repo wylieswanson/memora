@@ -42,6 +42,7 @@ def _make_args(**overrides):
         smart_focus_model_dir="./.mediapipe_models",
         smart_focus_face_model=None,
         smart_focus_pose_model=None,
+        ken_burns_engine=None,
         progress=False,
         sec=2.8,
         xfade=0.7,
@@ -263,6 +264,32 @@ class MemoraMotionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 vps.parse_args()
 
+    def test_parse_args_accepts_ken_burns_engine(self):
+        with patch("sys.argv", ["memoramotion", "./input_photos", "--ken-burns-engine", "fixed-viewport"]):
+            args = vps.parse_args()
+
+        self.assertEqual(args.ken_burns_engine, "fixed-viewport")
+
+    def test_parse_args_keeps_fixed_frame_alias_for_preserve_stage(self):
+        with patch("sys.argv", ["memoramotion", "./input_photos", "--ken-burns-engine", "fixed-frame"]):
+            args = vps.parse_args()
+
+        self.assertEqual(args.ken_burns_engine, "preserve-stage")
+
+    def test_validate_args_resolves_smart_focus_auto_engine_to_fixed_viewport(self):
+        args = _make_args(motion_style="kenburns", smart_focus=True, ken_burns_engine=None)
+
+        vps._validate_args(args)
+
+        self.assertEqual(args.ken_burns_engine, "fixed-viewport")
+
+    def test_validate_args_respects_explicit_smart_focus_engine(self):
+        args = _make_args(motion_style="kenburns", smart_focus=True, ken_burns_engine="preserve-stage")
+
+        vps._validate_args(args)
+
+        self.assertEqual(args.ken_burns_engine, "preserve-stage")
+
     # -----------------------------------------------------------------------
     # MediaPipe smart focus
     # -----------------------------------------------------------------------
@@ -272,6 +299,7 @@ class MemoraMotionTests(unittest.TestCase):
         pose_detector = object()
         mp_module = SimpleNamespace()
         base_options = MagicMock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+        base_options.Delegate = SimpleNamespace(CPU="cpu")
         mp_python_module = SimpleNamespace(BaseOptions=base_options)
         vision_module = SimpleNamespace(
             RunningMode=SimpleNamespace(IMAGE="image"),
@@ -312,6 +340,8 @@ class MemoraMotionTests(unittest.TestCase):
 
         self.assertEqual(vision_module.FaceDetector.create_from_options.call_args.args[0], "face-options")
         self.assertEqual(vision_module.PoseLandmarker.create_from_options.call_args.args[0], "pose-options")
+        self.assertEqual(base_options.call_args_list[0].kwargs["delegate"], "cpu")
+        self.assertEqual(base_options.call_args_list[1].kwargs["delegate"], "cpu")
 
     def test_get_mediapipe_detectors_reports_missing_tasks_api(self):
         old_face_detector = vps._MEDIAPIPE_FACE_DETECTOR
@@ -335,6 +365,26 @@ class MemoraMotionTests(unittest.TestCase):
                 vps._MEDIAPIPE_POSE_MODEL_PATH = old_pose_model
 
         self.assertIn("MediaPipe Tasks", str(ctx.exception))
+
+    def test_convert_to_pngs_preflights_smart_focus_before_pool(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for i in range(4):
+                Image.new("RGB", (10, 10), color="white").save(tmp_path / f"{i}.jpg")
+
+            with patch("memoramotion.preflight_smart_focus_runtime", side_effect=SystemExit("missing mediapipe")) as mock_preflight, \
+                 patch("memoramotion.Pool") as mock_pool:
+                with self.assertRaises(SystemExit) as ctx:
+                    vps.convert_to_pngs(
+                        tmp_path,
+                        tmp_path / "work",
+                        detect_focus=True,
+                        smart_focus_models=(tmp_path / "face.tflite", tmp_path / "pose.task"),
+                    )
+
+        self.assertEqual(str(ctx.exception), "missing mediapipe")
+        mock_preflight.assert_called_once()
+        mock_pool.assert_not_called()
 
     def test_smart_focus_parses_tasks_face_detection_result(self):
         detection = SimpleNamespace(
@@ -475,10 +525,10 @@ class MemoraMotionTests(unittest.TestCase):
         # Overlay anchors the zoom around the detected focal point instead of
         # translating the subject directly to frame center.
         self.assertIn("overlay=x=", filt)
-        self.assertIn("(0.25*(w/(", filt)
-        self.assertIn("-(0.25*w)", filt)
-        self.assertIn("(0.4*(h/(", filt)
-        self.assertIn("-(0.4*h)", filt)
+        self.assertIn("(0.4125*(w/(", filt)
+        self.assertIn("-(0.4125*w)", filt)
+        self.assertIn("(0.465*(h/(", filt)
+        self.assertIn("-(0.465*h)", filt)
         self.assertNotIn("round(1920/2)-", filt)
         self.assertIn("1.0756", filt)
         self.assertIn("*pow((1.0756/1),", filt)
@@ -486,6 +536,49 @@ class MemoraMotionTests(unittest.TestCase):
         self.assertIn("6*pow(min(max((t/2.8),0),1),5)-15*pow(min(max((t/2.8),0),1),4)+10*pow(min(max((t/2.8),0),1),3)", filt)
         # No hard crop step on FG
         self.assertNotIn(":x='", filt)
+
+    def test_build_filter_for_still_preserve_stage_kenburns_uses_zoompan_stage(self):
+        filt = vps.build_filter_for_still(
+            0,
+            1920,
+            1080,
+            30,
+            2.8,
+            ken_strength=0.0015,
+            focal_point=(0.25, 0.4),
+            ken_burns_engine="preserve-stage",
+        )
+
+        self.assertIn("force_original_aspect_ratio=increase", filt)
+        self.assertIn("force_original_aspect_ratio=decrease", filt)
+        self.assertIn("format=rgba,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black@0", filt)
+        self.assertIn("trim=end_frame=1,setpts=PTS-STARTPTS", filt)
+        self.assertIn("zoompan=z='", filt)
+        self.assertIn(":d=84:s=1920x1080:fps=30", filt)
+        self.assertIn("x='min(max((0.4125*iw)-(iw/zoom/2),0),iw-(iw/zoom))'", filt)
+        self.assertIn("y='min(max((0.465*ih)-(ih/zoom/2),0),ih-(ih/zoom))'", filt)
+        self.assertIn("[bg0][fg0]overlay=0:0:format=auto", filt)
+        self.assertIn("format=yuv420p[v0]", filt)
+
+    def test_build_filter_for_still_fixed_viewport_uses_stable_photo_footprint(self):
+        filt = vps.build_filter_for_still(
+            0,
+            1920,
+            1080,
+            30,
+            2.8,
+            ken_strength=0.0015,
+            focal_point=(0.25, 0.4),
+            ken_burns_engine="fixed-viewport",
+            source_size=(1200, 800),
+        )
+
+        self.assertIn("scale=1620:1080:force_original_aspect_ratio=decrease", filt)
+        self.assertIn("pad=1620:1080:(ow-iw)/2:(oh-ih)/2:color=black@0", filt)
+        self.assertIn("zoompan=z='", filt)
+        self.assertIn(":d=84:s=1620x1080:fps=30", filt)
+        self.assertIn("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black@0", filt)
+        self.assertIn("[bg0][fg0]overlay=0:0:format=auto", filt)
 
     def test_build_filter_for_still_kenburns_without_focus_still_uses_bg_fg(self):
         filt = vps.build_filter_for_still(
@@ -733,6 +826,7 @@ class MemoraMotionTests(unittest.TestCase):
         self.assertEqual(cfg.clip_grade, "full")
         self.assertEqual(cfg.clip_audio, "mute")
         self.assertEqual(cfg.encoder, "h264_videotoolbox")
+        self.assertEqual(cfg.ken_burns_engine, "fit-overlay")
 
     # -----------------------------------------------------------------------
     # ffmpeg progress / retry
@@ -804,7 +898,7 @@ class MemoraMotionTests(unittest.TestCase):
             output = stream.getvalue()
             self.assertIn(
                 "Render settings: encoder=libx264, resolution=1080p, quality=standard, "
-                "fps=30, bitrate=15M, transition=fade, motion=kenburns",
+                "fps=30, bitrate=15M, transition=fade, motion=kenburns, ken_burns_engine=fit-overlay",
                 output,
             )
             self.assertIn("DONE", output)
@@ -997,6 +1091,7 @@ class MemoraMotionTests(unittest.TestCase):
         mock_models.assert_called_once()
         mock_configure.assert_called_once_with(Path(tmp) / "face.tflite", Path(tmp) / "pose.task")
         self.assertEqual(mock_render.call_args.kwargs["focal_points"], [(0.3, 0.4)])
+        self.assertEqual(mock_render.call_args.args[4].ken_burns_engine, "fixed-viewport")
 
     def test_main_prints_prep_progress_when_enabled(self):
         with TemporaryDirectory() as tmp:

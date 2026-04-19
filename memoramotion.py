@@ -119,6 +119,12 @@ VALID_TRANSITIONS = {
     "zoomin",
 }
 
+KEN_BURNS_ENGINE_CHOICES = ["fit-overlay", "preserve-stage", "fixed-viewport"]
+KEN_BURNS_ENGINE_ALIASES = {"fixed-frame": "preserve-stage"}
+KEN_BURNS_FOCUS_BIAS = 0.35
+KEN_BURNS_STAGE_MARGIN_MIN = 0.03
+KEN_BURNS_STAGE_MARGIN_RATIO = 0.30
+
 
 @dataclass
 class PhotoInfo:
@@ -162,6 +168,7 @@ class RenderConfig:
     quality_name: str = "standard"
     encoder: str = "h264_videotoolbox"
     motion_style: str = "none"
+    ken_burns_engine: str = "fit-overlay"
     ken_override: Optional[float] = None
     parallax_override: Optional[int] = None
     motion_seed: int = 0
@@ -257,6 +264,77 @@ def clamp(value: float, lo: float, hi: float) -> float:
 def _ffmpeg_number(value: float) -> str:
     text = f"{value:.6f}".rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
+
+
+def normalize_ken_burns_engine(engine: str) -> str:
+    normalized = KEN_BURNS_ENGINE_ALIASES.get(engine.strip().lower(), engine.strip().lower())
+    if normalized not in KEN_BURNS_ENGINE_CHOICES:
+        supported = ", ".join(KEN_BURNS_ENGINE_CHOICES)
+        raise argparse.ArgumentTypeError(f"must be one of: {supported}")
+    return normalized
+
+
+def resolve_ken_burns_engine(engine: Optional[str], smart_focus: bool, motion_style: str) -> str:
+    if engine is None:
+        if smart_focus and motion_style in ("kenburns", "both"):
+            return "fixed-viewport"
+        return "fit-overlay"
+    return normalize_ken_burns_engine(engine)
+
+
+def _even_dimension(value: float) -> int:
+    return max(2, int(round(value / 2.0) * 2))
+
+
+def _fit_viewport_dimensions(
+    frame_width: int,
+    frame_height: int,
+    source_size: Optional[Tuple[int, int]],
+) -> Tuple[int, int]:
+    if not source_size:
+        return frame_width, frame_height
+
+    source_width, source_height = source_size
+    if source_width <= 0 or source_height <= 0:
+        return frame_width, frame_height
+
+    source_aspect = source_width / source_height
+    frame_aspect = frame_width / frame_height
+    if source_aspect >= frame_aspect:
+        viewport_width = frame_width
+        viewport_height = frame_width / source_aspect
+    else:
+        viewport_height = frame_height
+        viewport_width = frame_height * source_aspect
+
+    viewport_width = min(frame_width, _even_dimension(viewport_width))
+    viewport_height = min(frame_height, _even_dimension(viewport_height))
+    return max(2, viewport_width), max(2, viewport_height)
+
+
+def _biased_focus(focal_point: Optional[Tuple[float, float]]) -> Tuple[float, float, bool]:
+    if focal_point is None:
+        return 0.5, 0.5, False
+
+    raw_x = clamp(focal_point[0], 0.05, 0.95)
+    raw_y = clamp(focal_point[1], 0.05, 0.95)
+    focus_x = 0.5 + ((raw_x - 0.5) * KEN_BURNS_FOCUS_BIAS)
+    focus_y = 0.5 + ((raw_y - 0.5) * KEN_BURNS_FOCUS_BIAS)
+    return clamp(focus_x, 0.05, 0.95), clamp(focus_y, 0.05, 0.95), True
+
+
+def _ken_burns_ease_expr(progress_expr: str) -> str:
+    smooth_u = f"min(max({progress_expr},0),1)"
+    return f"(6*pow({smooth_u},5)-15*pow({smooth_u},4)+10*pow({smooth_u},3))"
+
+
+def _ken_burns_zoom_delta(ken_strength: float, sec: float, has_subject_target: bool) -> float:
+    # Convert strength into an across-shot zoom delta, independent of fps.
+    # Higher frame rates should feel smoother, not more aggressive.
+    zoom_delta = clamp(ken_strength * sec * 18.0, 0.0, 0.18)
+    if not has_subject_target:
+        zoom_delta *= 0.75
+    return zoom_delta
 
 
 def _download_smart_focus_model(url: str, dest: Path, label: str, show_progress: bool = False) -> None:
@@ -364,18 +442,25 @@ def _get_mediapipe_detectors() -> Tuple[Any, Any]:
     face_model_path, pose_model_path = _get_configured_smart_focus_models()
     _mp, mp_python, vision = _get_mediapipe_task_modules()
     base_options = mp_python.BaseOptions
+    base_options_delegate = getattr(base_options, "Delegate", None)
+    cpu_delegate = getattr(base_options_delegate, "CPU", None) if base_options_delegate is not None else None
+    face_base_options_kwargs = {"model_asset_path": str(face_model_path)}
+    pose_base_options_kwargs = {"model_asset_path": str(pose_model_path)}
+    if cpu_delegate is not None:
+        face_base_options_kwargs["delegate"] = cpu_delegate
+        pose_base_options_kwargs["delegate"] = cpu_delegate
 
     try:
         if _MEDIAPIPE_FACE_DETECTOR is None:
             face_options = vision.FaceDetectorOptions(
-                base_options=base_options(model_asset_path=str(face_model_path)),
+                base_options=base_options(**face_base_options_kwargs),
                 running_mode=vision.RunningMode.IMAGE,
                 min_detection_confidence=0.5,
             )
             _MEDIAPIPE_FACE_DETECTOR = vision.FaceDetector.create_from_options(face_options)
         if _MEDIAPIPE_POSE_DETECTOR is None:
             pose_options = vision.PoseLandmarkerOptions(
-                base_options=base_options(model_asset_path=str(pose_model_path)),
+                base_options=base_options(**pose_base_options_kwargs),
                 running_mode=vision.RunningMode.IMAGE,
                 num_poses=1,
                 min_pose_detection_confidence=0.5,
@@ -843,6 +928,11 @@ def _init_mediapipe_worker(face_model_path: Optional[str] = None, pose_model_pat
     _get_mediapipe_detectors()
 
 
+def preflight_smart_focus_runtime(smart_focus_models: Tuple[Path, Path]) -> None:
+    configure_smart_focus_models(*smart_focus_models)
+    _get_mediapipe_detectors()
+
+
 def convert_to_pngs(
     input_dir: Path,
     work_dir: Path,
@@ -871,7 +961,7 @@ def convert_to_pngs(
     if detect_focus:
         if smart_focus_models is None:
             smart_focus_models = _get_configured_smart_focus_models()
-        configure_smart_focus_models(*smart_focus_models)
+        preflight_smart_focus_runtime(smart_focus_models)
 
     def emit_progress(processed_count: int, focus_hits: int) -> None:
         if not show_progress:
@@ -1083,23 +1173,18 @@ def build_filter_for_still(
     motion_seed: int = 0,
     focal_point: Optional[Tuple[float, float]] = None,
     use_lanczos: bool = False,
+    ken_burns_engine: str = "fit-overlay",
+    source_size: Optional[Tuple[int, int]] = None,
 ) -> str:
     local_rng = random.Random(motion_seed + i * 101)
     scale_flags = ":flags=lanczos" if use_lanczos else ""
+    ken_burns_engine = normalize_ken_burns_engine(ken_burns_engine)
 
     u = f"(t/{sec})"
-    smooth_u = f"min(max({u},0),1)"
-    ease = f"(6*pow({smooth_u},5)-15*pow({smooth_u},4)+10*pow({smooth_u},3))"
+    ease = _ken_burns_ease_expr(u)
     if ken_strength > 0:
-        has_subject_target = focal_point is not None
-        focus_x = clamp(focal_point[0], 0.05, 0.95) if focal_point else 0.5
-        focus_y = clamp(focal_point[1], 0.05, 0.95) if focal_point else 0.5
-
-        # Convert strength into an across-shot zoom delta, independent of fps.
-        # Higher frame rates should feel smoother, not more aggressive.
-        zoom_delta = clamp(ken_strength * sec * 18.0, 0.0, 0.18)
-        if not has_subject_target:
-            zoom_delta *= 0.75
+        focus_x, focus_y, has_subject_target = _biased_focus(focal_point)
+        zoom_delta = _ken_burns_zoom_delta(ken_strength, sec, has_subject_target)
         zoom_in = local_rng.random() >= 0.5
         start_zoom = 1.0 if zoom_in else 1.0 + zoom_delta
         end_zoom = 1.0 + zoom_delta if zoom_in else 1.0
@@ -1109,13 +1194,53 @@ def build_filter_for_still(
         focus_y_s = _ffmpeg_number(focus_y)
         zoom = f"({start_zoom_s}*pow(({end_zoom_s}/{start_zoom_s}),{ease}))"
 
-        # Background: blurred fill, same as the no-motion path — ensures portrait photos
+        # Background: blurred fill, same as the no-motion path; ensures portrait photos
         # in landscape output (and any other aspect mismatch) always have a blurred backdrop.
         bg = (
             f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
             f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
             f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
         )
+
+        if ken_burns_engine in ("preserve-stage", "fixed-viewport"):
+            frame_count = max(1, int(round(sec * fps)))
+            on_max = max(1, frame_count - 1)
+            zoom_progress = f"(on/{on_max})"
+            zoom_ease = _ken_burns_ease_expr(zoom_progress)
+            zoom = f"({start_zoom_s}*pow(({end_zoom_s}/{start_zoom_s}),{zoom_ease}))"
+            pan_x = f"min(max(({focus_x_s}*iw)-(iw/zoom/2),0),iw-(iw/zoom))"
+            pan_y = f"min(max(({focus_y_s}*ih)-(ih/zoom/2),0),ih-(ih/zoom))"
+            if ken_burns_engine == "fixed-viewport":
+                viewport_w, viewport_h = _fit_viewport_dimensions(width, height, source_size)
+                fg = (
+                    f"[{i}:v]scale={viewport_w}:{viewport_h}:force_original_aspect_ratio=decrease{scale_flags},"
+                    f"format=rgba,pad={viewport_w}:{viewport_h}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1,"
+                    "trim=end_frame=1,setpts=PTS-STARTPTS,"
+                    f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frame_count}:s={viewport_w}x{viewport_h}:fps={fps},"
+                    f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+                    f"trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
+                )
+            else:
+                stage_margin = max(KEN_BURNS_STAGE_MARGIN_MIN, zoom_delta * KEN_BURNS_STAGE_MARGIN_RATIO)
+                stage_divisor = max(start_zoom, end_zoom) + stage_margin
+                stage_w = _even_dimension(width / stage_divisor)
+                stage_h = _even_dimension(height / stage_divisor)
+                fg = (
+                    f"[{i}:v]scale={stage_w}:{stage_h}:force_original_aspect_ratio=decrease{scale_flags},"
+                    f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1,"
+                    "trim=end_frame=1,setpts=PTS-STARTPTS,"
+                    f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frame_count}:s={width}x{height}:fps={fps},"
+                    f"trim=duration={sec},setpts=PTS-STARTPTS,format=rgba[fg{i}]"
+                )
+            comp = (
+                f"[bg{i}][fg{i}]overlay=0:0:format=auto,"
+                "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
+                "vignette=PI/10,"
+                "noise=alls=3:allf=t+u,"
+                f"format=yuv420p[v{i}]"
+            )
+            return ";\n".join([bg, fg, comp])
+
         # Foreground: first normalize cadence for the still, then animate zoom
         # so ffmpeg evaluates motion on the exact output frame timeline.
         fg = (
@@ -1381,11 +1506,14 @@ def build_render_command(
         if info and info.is_video:
             filters.append(build_filter_for_clip(i, width, height, cfg.fps, item_dur, cfg.blur_strength, cfg.clip_grade, use_lanczos))
         else:
+            source_size = (info.width, info.height) if info else None
             filters.append(build_filter_for_still(
                 i, width, height, cfg.fps, item_dur,
                 cfg.blur_strength, ken, para, cfg.motion_seed,
                 focal_points[i] if focal_points else None,
                 use_lanczos,
+                cfg.ken_burns_engine,
+                source_size,
             ))
 
     # Label overlays: composite label PNG onto each labeled stream.
@@ -1595,6 +1723,9 @@ def parse_args():
                     help="Burn location labels into the video as text (implies --geocode)")
     ap.add_argument("--motion-style", default="none", choices=["none", "kenburns", "parallax", "both"])
     ap.add_argument("--ken-burns-strength", type=float, default=None)
+    ap.add_argument("--ken-burns-engine", default=None, type=normalize_ken_burns_engine,
+                    choices=KEN_BURNS_ENGINE_CHOICES,
+                    help="Ken Burns renderer: auto, fit-overlay, preserve-stage, or fixed-viewport")
     ap.add_argument("--parallax-px", type=int, default=None)
     ap.add_argument("--smart-focus", action="store_true",
                     help="Use MediaPipe Tasks face detection with pose fallback to bias Ken Burns framing")
@@ -2051,6 +2182,14 @@ def _validate_args(args) -> None:
         raise SystemExit("--max-workers must be >= 0")
     if args.ken_burns_strength is not None and not (0.0 <= args.ken_burns_strength <= 0.03):
         raise SystemExit("--ken-burns-strength must be between 0.0 and 0.03")
+    try:
+        args.ken_burns_engine = resolve_ken_burns_engine(
+            getattr(args, "ken_burns_engine", None),
+            bool(getattr(args, "smart_focus", False)),
+            getattr(args, "motion_style", "none"),
+        )
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"--ken-burns-engine {exc}") from exc
     if args.parallax_px is not None and args.parallax_px < 0:
         raise SystemExit("--parallax-px must be >= 0")
     if getattr(args, "smart_focus_face_model", None) and not Path(args.smart_focus_face_model).expanduser().is_file():
@@ -2264,6 +2403,7 @@ def main():
             "Render settings: "
             f"encoder={encoder}, resolution={resolution}, quality={args.quality}, "
             f"fps={fps}, bitrate={bitrate}, transition={args.transition}, motion={args.motion_style}, "
+            f"ken_burns_engine={args.ken_burns_engine}, "
             f"estimated_duration={estimated_total:.1f}s"
         )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2305,6 +2445,7 @@ def main():
             fps=fps, sec=args.sec, xfade=args.xfade, transition=args.transition,
             blur_strength=blur, bitrate=bitrate, quality_name=args.quality,
             encoder=encoder, motion_style=args.motion_style,
+            ken_burns_engine=args.ken_burns_engine,
             ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
             motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
             audio_path=audio_path,

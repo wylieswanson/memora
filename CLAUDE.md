@@ -73,6 +73,7 @@ MOTION_PRESETS = {
     "both":     {"ken": 0.0015, "parallax_ratio": 0.0028},
 }
 
+KEN_BURNS_ENGINE_CHOICES = ["fit-overlay", "preserve-stage", "fixed-viewport"]
 PRO_TRANSITIONS = ["fade", "smoothleft", "smoothright"]  # auto mode rotates through these
 ```
 
@@ -154,7 +155,10 @@ Photos (`.jpg`, `.heic`, etc.) and video clips (`.mp4`, `.mov`) can be mixed fre
 **Photos** — `build_filter_for_still()`:
 - Input via `-loop 1 -t <dur>` (still image looped for its duration)
 - **No motion** (`ken_strength == 0`): `scale (bg fill, increase) → boxblur` + `scale (fg fit, decrease)` → `overlay=(W-w)/2:(H-h)/2` → grade → vignette → grain. Optional parallax animates the overlay x position.
-- **Ken Burns** (`ken_strength > 0`): same bg path as no-motion; fg uses `scale (decrease, fit) → fps/trim/setpts → scale (zoom, eval=frame)`. The zoom uses duration-based strength, smootherstep easing, and multiplicative interpolation so higher FPS only improves smoothness instead of increasing zoom distance. The overlay x/y expressions use **float (sub-pixel) positioning** — no `round()` — so motion is continuous without stairstepping. The overlay expression anchors the zoom around the focal point at its neutral fitted-frame position, so smart focus reads as zooming into/out from the subject instead of sliding the foreground photo to center. Both paths always show the blurred background, preserving portrait photos in landscape output.
+- **Ken Burns / `fit-overlay` engine** (`ken_strength > 0`, default unless smart focus auto-selects `fixed-viewport`): same bg path as no-motion; fg uses `scale (decrease, fit) → fps/trim/setpts → scale (zoom, eval=frame)`. The zoom uses duration-based strength, smootherstep easing, and multiplicative interpolation so higher FPS only improves smoothness instead of increasing zoom distance. Smart-focus points are blended toward center by `KEN_BURNS_FOCUS_BIAS` so they gently bias the zoom instead of dragging the photo.
+- **Ken Burns / `preserve-stage` engine** (`--ken-burns-engine preserve-stage`): full-photo-preserving zoompan path. It fits the foreground into a smaller transparent full-frame stage, uses `zoompan` to animate that fixed-size stage with a small preservation margin, then overlays the full-frame result at `0:0`. This keeps full-photo visibility, but the visible foreground footprint may subtly resize. `fixed-frame` remains accepted as an alias for this engine.
+- **Ken Burns / `fixed-viewport` engine** (`--ken-burns-engine fixed-viewport`): stable-footprint path. It computes the fitted photo viewport from `PhotoInfo` dimensions, keeps that viewport centered and fixed, then uses `zoompan` to zoom/pan content inside it. This is the cleanest smart-focus motion, but it can crop during the zoom.
+- `--ken-burns-engine` defaults to auto: `fit-overlay` normally, `fixed-viewport` when `--smart-focus` is active with `kenburns` or `both`. Explicit engine flags override auto selection.
 - Both functions accept `use_lanczos: bool` (set by `build_render_command` when `quality_name` is `high`, `youtube`, or `max`). When true, `:flags=lanczos` is appended to all fg scale filters; the blurred bg scale is unaffected.
 
 **Clips** — `build_filter_for_clip()`:
