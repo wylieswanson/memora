@@ -314,6 +314,67 @@ class MemoraMotionTests(unittest.TestCase):
 
         self.assertEqual(args.ken_burns_engine, "preserve-stage")
 
+    def test_validate_args_location_stats_implies_geocode(self):
+        args = _make_args(location_stats=True, geocode=False)
+
+        with patch("sys.stderr"):
+            vps._validate_args(args)
+
+        self.assertTrue(args.geocode)
+
+    def test_validate_args_location_overlay_implies_geocode(self):
+        args = _make_args(location_overlay=True, geocode=False)
+
+        import io
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            vps._validate_args(args)
+
+        self.assertTrue(args.geocode)
+        self.assertIn("geocoding", err.getvalue())
+
+    def test_parse_args_settings_defaults_to_on(self):
+        with patch("sys.argv", ["memoramotion", "input_photos"]):
+            args = vps.parse_args()
+        self.assertEqual(args.settings, "on")
+
+    def test_parse_args_settings_accepts_all_modes(self):
+        for mode in ("on", "off", "json"):
+            with patch("sys.argv", ["memoramotion", "input_photos", "--settings", mode]):
+                args = vps.parse_args()
+            self.assertEqual(args.settings, mode)
+
+    def test_build_effective_settings_includes_derived_values(self):
+        args = _make_args(quality="youtube", resolution="4k", format="16x9", motion_style="none")
+        settings = vps.build_effective_settings(args, fps=30, resolution="4k", bitrate="45M", encoder="h264_videotoolbox")
+        self.assertEqual(settings["fps"], 30)
+        self.assertEqual(settings["bitrate"], "45M")
+        self.assertEqual(settings["encoder"], "h264_videotoolbox")
+        self.assertIn("16x9", settings["target_dimensions"])
+        self.assertEqual(settings["target_dimensions"]["16x9"], (3840, 2160))
+        self.assertNotIn("9x16", settings["target_dimensions"])
+        self.assertIn("ken_burns_strength", settings)
+        self.assertIn("parallax_px", settings)
+
+    def test_print_effective_settings_json_is_parseable(self):
+        import json, io
+        args = _make_args(format="both", motion_style="none")
+        settings = vps.build_effective_settings(args, fps=30, resolution="1080p", bitrate="15M", encoder="libx264")
+        out = io.StringIO()
+        with patch("builtins.print", side_effect=lambda *a, **k: out.write(str(a[0]) + "\n")):
+            vps.print_effective_settings(settings, "json")
+        parsed = json.loads(out.getvalue())
+        self.assertIn("fps", parsed)
+        self.assertIn("target_dimensions", parsed)
+
+    def test_print_effective_settings_off_suppresses_block(self):
+        args = _make_args(motion_style="none")
+        settings = vps.build_effective_settings(args, fps=30, resolution="1080p", bitrate="15M", encoder="libx264")
+        printed = []
+        with patch("builtins.print", side_effect=printed.append):
+            vps.print_effective_settings(settings, "off")
+        self.assertEqual(printed, [])
+
     # -----------------------------------------------------------------------
     # MediaPipe smart focus
     # -----------------------------------------------------------------------
@@ -986,11 +1047,11 @@ class MemoraMotionTests(unittest.TestCase):
                 vps.main()
 
             output = stream.getvalue()
-            self.assertIn(
-                "Render settings: encoder=libx264, resolution=1080p, quality=standard, "
-                "fps=30, bitrate=15M, transition=fade, motion=kenburns, ken_burns_engine=fit-overlay",
-                output,
-            )
+            self.assertIn("Memora Motion", output)
+            self.assertIn("encoder=libx264", output)
+            self.assertIn("fps=30", output)
+            self.assertIn("bitrate=15M", output)
+            self.assertIn("kenburns", output)
             self.assertIn("DONE", output)
             mock_render.assert_called_once()
             render_call = mock_render.call_args

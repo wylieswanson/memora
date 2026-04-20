@@ -1837,6 +1837,8 @@ def parse_args():
                     help="YouTube category ID (default 22 = People & Blogs)")
     ap.add_argument("--youtube-privacy", default="private", choices=["private", "public", "unlisted"],
                     help="YouTube privacy status")
+    ap.add_argument("--settings", default="on", choices=["on", "off", "json"],
+                    help="Show resolved settings before rendering: on (human-readable), off (suppress), json (machine-readable)")
     return ap.parse_args()
 
 
@@ -2223,6 +2225,119 @@ def build_label_overlay_paths_for_infos(
     return result
 
 
+def build_effective_settings(args, fps: int, resolution: str, bitrate: str, encoder: str) -> dict:
+    target_dims: dict = {}
+    if args.format in ("16x9", "both"):
+        target_dims["16x9"] = RESOLUTION_PRESETS[resolution]["16x9"]
+    if args.format in ("9x16", "both"):
+        target_dims["9x16"] = RESOLUTION_PRESETS[resolution]["9x16"]
+    frame_min_dim = min(min(w, h) for w, h in target_dims.values()) if target_dims else 1080
+    ken, parallax_px = resolve_motion_values(
+        args.motion_style,
+        getattr(args, "ken_burns_strength", None),
+        getattr(args, "parallax_px", None),
+        frame_min_dim,
+        args.sec,
+    )
+    return {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "source_dir": args.source_dir,
+        "outdir": args.outdir,
+        "workdir": args.workdir,
+        "format": args.format,
+        "resolution": resolution,
+        "target_dimensions": target_dims,
+        "quality": args.quality,
+        "fps": fps,
+        "bitrate": bitrate,
+        "encoder": encoder,
+        "dry_run": args.dry_run,
+        "sec": args.sec,
+        "xfade": args.xfade,
+        "transition": args.transition,
+        "rhythm_strength": args.rhythm_strength,
+        "sort_by": args.sort_by,
+        "seed": args.seed,
+        "split_secs": args.split_secs,
+        "motion_style": args.motion_style,
+        "ken_burns_engine": args.ken_burns_engine,
+        "ken_burns_strength": ken,
+        "parallax_px": parallax_px,
+        "smart_focus": args.smart_focus,
+        "smart_focus_model_dir": getattr(args, "smart_focus_model_dir", "./.mediapipe_models"),
+        "smart_focus_face_model": getattr(args, "smart_focus_face_model", None),
+        "smart_focus_pose_model": getattr(args, "smart_focus_pose_model", None),
+        "camera_stats": args.camera_stats,
+        "geocode": args.geocode,
+        "location_stats": args.location_stats,
+        "location_overlay": args.location_overlay,
+        "clip_grade": args.clip_grade,
+        "clip_audio": args.clip_audio,
+        "clip_max_sec": args.clip_max_sec,
+        "audio": str(Path(args.audio)) if args.audio else None,
+        "audio_offset": args.audio_offset,
+        "audio_fade": args.audio_fade,
+        "youtube_upload": args.youtube_upload,
+        "youtube_upload_file": str(args.youtube_upload_file) if args.youtube_upload_file else None,
+        "youtube_privacy": args.youtube_privacy,
+        "add_to_photos": args.add_to_photos,
+    }
+
+
+def print_effective_settings(settings: dict, mode: str) -> None:
+    if mode == "off":
+        return
+    if mode == "json":
+        print(json.dumps(settings, indent=2))
+        return
+    dims_parts = [f"{fmt} {w}×{h}" for fmt, (w, h) in settings["target_dimensions"].items()]
+    dims_str = "  ".join(dims_parts) if dims_parts else "(none)"
+    lines = [
+        f"{settings['app_name']} {settings['app_version']}",
+        f"  source:   {settings['source_dir'] or '(none)'}",
+        f"  output:   {settings['outdir']}  workdir={settings['workdir']}",
+        f"  format:   {settings['format']}  [{dims_str}]",
+        f"  quality:  {settings['quality']}  fps={settings['fps']}  bitrate={settings['bitrate']}"
+        f"  encoder={settings['encoder']}  dry_run={settings['dry_run']}",
+        f"  timing:   sec={settings['sec']}  xfade={settings['xfade']}"
+        f"  transition={settings['transition']}  rhythm={settings['rhythm_strength']}"
+        f"  sort={settings['sort_by']}  seed={settings['seed']}",
+    ]
+    if settings["split_secs"] is not None:
+        lines[-1] += f"  split_secs={settings['split_secs']}"
+    lines.append(
+        f"  motion:   {settings['motion_style']}  ken={settings['ken_burns_strength']:.4f}"
+        f"  parallax={settings['parallax_px']}px  engine={settings['ken_burns_engine']}"
+        f"  smart_focus={settings['smart_focus']}"
+    )
+    clip_line = (
+        f"  clips:    grade={settings['clip_grade']}  audio={settings['clip_audio']}"
+    )
+    if settings["clip_max_sec"] is not None:
+        clip_line += f"  max_sec={settings['clip_max_sec']}"
+    lines.append(clip_line)
+    audio_line = f"  audio:    {settings['audio'] or '(none)'}  offset={settings['audio_offset']}s"
+    if settings["audio_fade"] is not None:
+        audio_line += f"  fade={settings['audio_fade']}s"
+    lines.append(audio_line)
+    actions = []
+    if settings["youtube_upload"]:
+        actions.append(f"youtube={settings['youtube_privacy']}")
+    if settings["youtube_upload_file"]:
+        actions.append(f"upload-file={settings['youtube_upload_file']}")
+    if settings["add_to_photos"]:
+        actions.append("add-to-photos")
+    extras = [
+        k for k in ("camera_stats", "geocode", "location_stats", "location_overlay")
+        if settings.get(k)
+    ]
+    lines.append(f"  actions:  {', '.join(actions) if actions else '(none)'}")
+    if extras:
+        lines.append(f"  extras:   {', '.join(extras)}")
+    print("\n".join(lines))
+
+
 def _validate_args(args) -> None:
     should_upload = args.youtube_upload or bool(args.youtube_upload_file)
     try:
@@ -2357,6 +2472,184 @@ def _post_render_output(
         print(f"YouTube upload complete: https://www.youtube.com/watch?v={video_id}")
 
 
+def _phase_prep(
+    args,
+    src: Path,
+    temp_work: Path,
+    blur: int,
+    fps: int,
+    resolution: str,
+    bitrate: str,
+    encoder: str,
+    audio_path: Optional[Path],
+):
+    do_geocode = args.geocode or args.location_stats or args.location_overlay
+    extract_exif = args.sort_by in ("time", "location") or args.camera_stats or do_geocode
+    detect_focus = args.smart_focus and args.motion_style in ("kenburns", "both")
+    smart_focus_models = None
+    if detect_focus:
+        smart_focus_models = resolve_smart_focus_model_paths(
+            Path(getattr(args, "smart_focus_model_dir", "./.mediapipe_models")),
+            face_model=getattr(args, "smart_focus_face_model", None),
+            pose_model=getattr(args, "smart_focus_pose_model", None),
+            show_progress=args.progress,
+        )
+        configure_smart_focus_models(*smart_focus_models)
+    progress_print(args.progress, f"[phase prep] scanning {src}")
+    if detect_focus:
+        progress_print(args.progress, "[phase prep] initializing smart focus detectors")
+    progress_print(
+        args.progress,
+        f"[phase prep] collecting media ({'conversion + smart focus' if detect_focus else 'conversion'}"
+        " for images, probe for video clips)",
+    )
+    images, infos = collect_media(
+        src, temp_work,
+        extract_exif=extract_exif, detect_focus=detect_focus,
+        smart_focus_models=smart_focus_models, max_workers=args.max_workers,
+        show_progress=args.progress,
+    )
+    if not images:
+        raise SystemExit(
+            f"No supported media found in {src}. "
+            f"Images: {', '.join(sorted(IMG_EXTS))}  Videos: {', '.join(sorted(VID_EXTS))}"
+        )
+
+    n_clips = sum(1 for i in infos if i and i.is_video)
+    if args.clip_audio in ("keep", "duck") and n_clips == 0:
+        print(f"Warning: --clip-audio {args.clip_audio} has no effect; no video clips found in {src}", file=sys.stderr)
+    progress_print(args.progress, f"[phase prep] ordering {len(images)} items ({n_clips} video clips) with sort={args.sort_by}")
+    images, infos = sort_images_and_infos(images, infos, sort_by=args.sort_by, seed=args.seed)
+    if args.camera_stats:
+        print_camera_stats(infos)
+    if do_geocode:
+        progress_print(args.progress, f"[phase geocode] reverse-geocoding {sum(1 for i in infos if i and i.gps_coords)} photos with GPS...")
+        geocode_photos(infos, show_progress=args.progress)
+    if args.location_stats:
+        print_location_stats(infos)
+    focal_points = [info.focal_point if info else None for info in infos]
+    if detect_focus:
+        focused_count = sum(1 for point in focal_points if point is not None)
+        print(f"Smart focus: detected subjects in {focused_count}/{len(focal_points) - n_clips} photos")
+
+    estimated_total = estimate_duration_variable(
+        build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
+        args.xfade,
+    )
+    n_photos = len(images) - n_clips
+    print(f"Media: {n_photos} photos, {n_clips} clips → estimated {estimated_total:.1f}s total")
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    targets = build_targets(
+        args.format, stamp, src.name, args.quality, args.transition,
+        n_photos, n_clips, resolution=resolution,
+    )
+
+    if args.split_secs is not None:
+        part_groups = split_photos_into_parts(
+            images, infos, focal_points,
+            args.sec, args.xfade, args.rhythm_strength, args.seed,
+            args.split_secs, clip_max_sec=args.clip_max_sec,
+        )
+        if len(part_groups) <= 1:
+            progress_print(args.progress, "[phase split] skipped: content fits in a single part")
+            part_groups = []
+    else:
+        part_groups = []
+
+    part_audio_offsets: List[float] = []
+    cumulative = 0.0
+    for _, part_infos, _ in part_groups:
+        part_audio_offsets.append(cumulative)
+        cumulative += estimate_duration_variable(
+            build_media_durations(part_infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
+            args.xfade,
+        )
+
+    base_cfg = RenderConfig(
+        fps=fps, sec=args.sec, xfade=args.xfade, transition=args.transition,
+        blur_strength=blur, bitrate=bitrate, quality_name=args.quality,
+        encoder=encoder, motion_style=args.motion_style,
+        ken_burns_engine=args.ken_burns_engine,
+        ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
+        motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
+        audio_path=audio_path, audio_offset=args.audio_offset, audio_fade=args.audio_fade,
+        clip_grade=args.clip_grade, clip_audio=args.clip_audio, clip_max_sec=args.clip_max_sec,
+    )
+    return images, infos, focal_points, n_clips, targets, part_groups, part_audio_offsets, base_cfg
+
+
+def _phase_render(
+    args,
+    src: Path,
+    images: List[Path],
+    infos: List[Optional[PhotoInfo]],
+    focal_points: list,
+    n_clips: int,
+    base_cfg: RenderConfig,
+    targets: list,
+    outdir: Path,
+    temp_work: Path,
+    part_groups: list,
+    part_audio_offsets: List[float],
+    encoder: str,
+    youtube_client_secrets: Path,
+    youtube_token_file: Path,
+    youtube_tags: List[str],
+) -> List[Path]:
+    outputs: List[Path] = []
+    for name, width, height in targets:
+        out = outdir / name
+        progress_print(args.progress, f"[phase render] starting {width}x{height} → {out.name}")
+        label_overlay_paths = (
+            build_label_overlay_paths_for_infos(infos, width, height, temp_work, "main")
+            if args.location_overlay else None
+        )
+        if args.dry_run:
+            cmd, duration = build_render_command(
+                images, out, width, height, base_cfg,
+                focal_points=focal_points, label_overlay_paths=label_overlay_paths, infos=infos,
+            )
+            print(f"[dry-run] {width}x{height} estimated_duration={duration:.1f}s")
+            print(f"[dry-run] {' '.join(cmd)}")
+        else:
+            actual_encoder = render(
+                images, out, width, height, base_cfg,
+                focal_points=focal_points, label_overlay_paths=label_overlay_paths, infos=infos,
+            )
+            outputs.append(out)
+            note = f" (used {actual_encoder})" if actual_encoder != encoder else ""
+            progress_print(args.progress, f"[phase render] completed {out.name}{note}")
+            _post_render_output(out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
+
+        if part_groups:
+            progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
+            for part_idx, (part_imgs, part_infos, part_focal) in enumerate(part_groups, start=1):
+                part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
+                progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} items → {part_out.name}")
+                part_label_paths = (
+                    build_label_overlay_paths_for_infos(part_infos, width, height, temp_work, f"p{part_idx}")
+                    if args.location_overlay else None
+                )
+                part_cfg = dataclass_replace(base_cfg, audio_offset=args.audio_offset + part_audio_offsets[part_idx - 1])
+                if args.dry_run:
+                    cmd, duration = build_render_command(
+                        part_imgs, part_out, width, height, part_cfg,
+                        focal_points=part_focal, label_overlay_paths=part_label_paths, infos=part_infos,
+                    )
+                    print(f"[dry-run] part {part_idx} {width}x{height} estimated_duration={duration:.1f}s")
+                    print(f"[dry-run] {' '.join(cmd)}")
+                else:
+                    render(
+                        part_imgs, part_out, width, height, part_cfg,
+                        focal_points=part_focal, label_overlay_paths=part_label_paths, infos=part_infos,
+                    )
+                    outputs.append(part_out)
+                    progress_print(args.progress, f"[phase split] completed {part_out.name}")
+                    _post_render_output(part_out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
+    return outputs
+
+
 def main():
     t0 = time.time()
     args = parse_args()
@@ -2396,186 +2689,26 @@ def main():
         )
 
     if resolution == "8k":
-        print(
-            "Warning: 8K output is experimental and can be very slow with very large files.",
-            file=sys.stderr,
-        )
+        print("Warning: 8K output is experimental and can be very slow with very large files.", file=sys.stderr)
 
     ensure_dir(Path(args.workdir))
     temp_work = Path(tempfile.mkdtemp(prefix="memoramotion_", dir=str(Path(args.workdir))))
 
     try:
-        blur = preset["blur_strength"]
-
-        do_geocode = args.geocode or args.location_stats or args.location_overlay
-        extract_exif = args.sort_by in ("time", "location") or args.camera_stats or do_geocode
-        detect_focus = args.smart_focus and args.motion_style in ("kenburns", "both")
-        smart_focus_models = None
-        if detect_focus:
-            smart_focus_model_dir = getattr(args, "smart_focus_model_dir", "./.mediapipe_models")
-            smart_focus_face_model = getattr(args, "smart_focus_face_model", None)
-            smart_focus_pose_model = getattr(args, "smart_focus_pose_model", None)
-            smart_focus_models = resolve_smart_focus_model_paths(
-                Path(smart_focus_model_dir),
-                face_model=smart_focus_face_model,
-                pose_model=smart_focus_pose_model,
-                show_progress=args.progress,
-            )
-            configure_smart_focus_models(*smart_focus_models)
-        progress_print(args.progress, f"[phase prep] scanning {src}")
-        if detect_focus:
-            progress_print(args.progress, "[phase prep] initializing smart focus detectors")
-        progress_print(args.progress, f"[phase prep] collecting media ({'conversion + smart focus' if detect_focus else 'conversion'} for images, probe for video clips)")
-        images, infos = collect_media(
-            src,
-            temp_work,
-            extract_exif=extract_exif,
-            detect_focus=detect_focus,
-            smart_focus_models=smart_focus_models,
-            max_workers=args.max_workers,
-            show_progress=args.progress,
-        )
-        if not images:
-            raise SystemExit(
-                f"No supported media found in {src}. "
-                f"Images: {', '.join(sorted(IMG_EXTS))}  "
-                f"Videos: {', '.join(sorted(VID_EXTS))}"
-            )
-
-        n_clips = sum(1 for i in infos if i and i.is_video)
-        if args.clip_audio in ("keep", "duck") and n_clips == 0:
-            print(f"Warning: --clip-audio {args.clip_audio} has no effect; no video clips found in {src}", file=sys.stderr)
-        progress_print(args.progress, f"[phase prep] ordering {len(images)} items ({n_clips} video clips) with sort={args.sort_by}")
-        images, infos = sort_images_and_infos(images, infos, sort_by=args.sort_by, seed=args.seed)
-        if args.camera_stats:
-            print_camera_stats(infos)
-        if do_geocode:
-            progress_print(args.progress, f"[phase geocode] reverse-geocoding {sum(1 for i in infos if i and i.gps_coords)} photos with GPS...")
-            geocode_photos(infos, show_progress=args.progress)
-        if args.location_stats:
-            print_location_stats(infos)
-        focal_points = [info.focal_point if info else None for info in infos]
-        if detect_focus:
-            focused_count = sum(1 for point in focal_points if point is not None)
-            print(f"Smart focus: detected subjects in {focused_count}/{len(focal_points) - n_clips} photos")
-
         encoder = "h264_videotoolbox" if ffmpeg_has_encoder("h264_videotoolbox") else "libx264"
-        estimated_total = estimate_duration_variable(
-            build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
-            args.xfade,
+
+        if getattr(args, "settings", "on") != "off":
+            settings = build_effective_settings(args, fps, resolution, bitrate, encoder)
+            print_effective_settings(settings, getattr(args, "settings", "on"))
+
+        images, infos, focal_points, n_clips, targets, part_groups, part_audio_offsets, base_cfg = _phase_prep(
+            args, src, temp_work, preset["blur_strength"], fps, resolution, bitrate, encoder, audio_path,
         )
-        print(
-            "Render settings: "
-            f"encoder={encoder}, resolution={resolution}, quality={args.quality}, "
-            f"fps={fps}, bitrate={bitrate}, transition={args.transition}, motion={args.motion_style}, "
-            f"ken_burns_engine={args.ken_burns_engine}, "
-            f"estimated_duration={estimated_total:.1f}s"
+        outputs = _phase_render(
+            args, src, images, infos, focal_points, n_clips, base_cfg, targets, outdir,
+            temp_work, part_groups, part_audio_offsets, encoder,
+            youtube_client_secrets, youtube_token_file, youtube_tags,
         )
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        n_photos = len(images) - n_clips
-        targets = build_targets(
-            args.format,
-            stamp,
-            src.name,
-            args.quality,
-            args.transition,
-            n_photos,
-            n_clips,
-            resolution=resolution,
-        )
-
-        if args.split_secs is not None:
-            part_groups = split_photos_into_parts(
-                images, infos, focal_points,
-                args.sec, args.xfade, args.rhythm_strength, args.seed,
-                args.split_secs,
-                clip_max_sec=args.clip_max_sec,
-            )
-            if len(part_groups) <= 1:
-                progress_print(args.progress, "[phase split] skipped: content fits in a single part")
-                part_groups = []
-        else:
-            part_groups = []
-
-        part_audio_offsets: List[float] = []
-        cumulative = 0.0
-        for part_imgs, part_infos, _ in part_groups:
-            part_audio_offsets.append(cumulative)
-            cumulative += estimate_duration_variable(
-                build_media_durations(part_infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
-                args.xfade,
-            )
-
-        base_cfg = RenderConfig(
-            fps=fps, sec=args.sec, xfade=args.xfade, transition=args.transition,
-            blur_strength=blur, bitrate=bitrate, quality_name=args.quality,
-            encoder=encoder, motion_style=args.motion_style,
-            ken_burns_engine=args.ken_burns_engine,
-            ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
-            motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
-            audio_path=audio_path,
-            audio_offset=args.audio_offset,
-            audio_fade=args.audio_fade,
-            clip_grade=args.clip_grade, clip_audio=args.clip_audio,
-            clip_max_sec=args.clip_max_sec,
-        )
-
-        outputs = []
-        for name, width, height in targets:
-            out = outdir / name
-            progress_print(args.progress, f"[phase render] starting {width}x{height} -> {out.name}")
-            label_overlay_paths = (
-                build_label_overlay_paths_for_infos(infos, width, height, temp_work, "main")
-                if args.location_overlay
-                else None
-            )
-            if args.dry_run:
-                cmd, duration = build_render_command(
-                    images, out, width, height, base_cfg,
-                    focal_points=focal_points, label_overlay_paths=label_overlay_paths,
-                    infos=infos,
-                )
-                print(f"[dry-run] {width}x{height} estimated_duration={duration:.1f}s")
-                print(f"[dry-run] {' '.join(cmd)}")
-            else:
-                actual_encoder = render(
-                    images, out, width, height, base_cfg,
-                    focal_points=focal_points, label_overlay_paths=label_overlay_paths,
-                    infos=infos,
-                )
-                outputs.append(out)
-                note = f" (used {actual_encoder})" if actual_encoder != encoder else ""
-                progress_print(args.progress, f"[phase render] completed {out.name}{note}")
-                _post_render_output(out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
-
-            if part_groups:
-                progress_print(args.progress, f"[phase split] rendering {len(part_groups)} parts (<={args.split_secs}s each)")
-                for part_idx, (part_imgs, part_infos, part_focal) in enumerate(part_groups, start=1):
-                    part_out = outdir / f"{out.stem}_part{part_idx:03d}.mp4"
-                    progress_print(args.progress, f"[phase split] part {part_idx}/{len(part_groups)}: {len(part_imgs)} items -> {part_out.name}")
-                    part_label_paths = (
-                        build_label_overlay_paths_for_infos(part_infos, width, height, temp_work, f"p{part_idx}")
-                        if args.location_overlay
-                        else None
-                    )
-                    part_cfg = dataclass_replace(base_cfg, audio_offset=args.audio_offset + part_audio_offsets[part_idx - 1])
-                    if args.dry_run:
-                        cmd, duration = build_render_command(
-                            part_imgs, part_out, width, height, part_cfg,
-                            focal_points=part_focal, label_overlay_paths=part_label_paths,
-                            infos=part_infos,
-                        )
-                        print(f"[dry-run] part {part_idx} {width}x{height} estimated_duration={duration:.1f}s")
-                        print(f"[dry-run] {' '.join(cmd)}")
-                    else:
-                        render(
-                            part_imgs, part_out, width, height, part_cfg,
-                            focal_points=part_focal, label_overlay_paths=part_label_paths,
-                            infos=part_infos,
-                        )
-                        outputs.append(part_out)
-                        progress_print(args.progress, f"[phase split] completed {part_out.name}")
-                        _post_render_output(part_out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
     except RuntimeError as exc:
         raise SystemExit(str(exc))
     else:
