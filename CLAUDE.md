@@ -19,18 +19,19 @@ Key output characteristics:
 
 **Processing pipeline** (in execution order):
 0. Preflight `ffmpeg`/`ffprobe`; if `--youtube-upload` is set, validate/refresh YouTube OAuth credentials before rendering so auth failures happen early
-1. Scan input dir for supported files → `IMG_EXTS` + `VID_EXTS`
-2. Images: convert to normalized PNG in parallel → `convert_to_pngs()` / `_convert_single_image()`
+1. Detect encoder (`h264_videotoolbox` or `libx264`); print resolved settings via `build_effective_settings()` / `print_effective_settings()` unless `--settings off`
+2. Scan input dir for supported files → `IMG_EXTS` + `VID_EXTS` — orchestrated by `_phase_prep()`
+3. Images: convert to normalized PNG in parallel → `convert_to_pngs()` / `_convert_single_image()`
    Video clips: probe via ffprobe → `probe_video_clip()`
    Merge in natural sort order → `collect_media()`
-3. Extract photo metadata (EXIF, GPS, camera) → `get_image_metadata()`; clips get creation time from container
-4. Optional subject detection on photos → `detect_subject_focus()` (MediaPipe)
-5. Sort → `sort_images_and_infos()`
-6. Optional geocoding → `geocode_photos()`
-7. Build per-item FFmpeg filters → `build_filter_for_still()` or `build_filter_for_clip()`
-8. Chain transitions → `build_xfade_chain()`
-9. Execute ffmpeg → `run_ffmpeg_with_progress()`
-10. Post-render: YouTube upload and/or macOS Photos import
+4. Extract photo metadata (EXIF, GPS, camera) → `get_image_metadata()`; clips get creation time from container
+5. Optional subject detection on photos → `detect_subject_focus()` (MediaPipe)
+6. Sort → `sort_images_and_infos()`
+7. Optional geocoding → `geocode_photos()`
+8. Build per-item FFmpeg filters → `build_filter_for_still()` (dispatches to `_filter_still_no_motion`, `_filter_still_fit_overlay`, `_filter_still_fixed_viewport`, `_filter_still_preserve_stage`) or `build_filter_for_clip()` — orchestrated by `_phase_render()`
+9. Chain transitions → `build_xfade_chain()`
+10. Execute ffmpeg → `run_ffmpeg_with_progress()`
+11. Post-render: YouTube upload and/or macOS Photos import
 
 **Key data structure**: `PhotoInfo` dataclass (path, dimensions, aspect ratio, EXIF, GPS, camera, focal point, `is_video`, `video_duration`).
 
@@ -195,6 +196,15 @@ memoramotion ./input_photos
 
 # Dry run — prints ffmpeg command without rendering
 memoramotion ./input_photos --dry-run --progress
+
+# Inspect all resolved settings before any media work (default: on)
+memoramotion ./input_photos --quality youtube --resolution 4k --settings on
+
+# Machine-readable settings for scripting
+memoramotion ./input_photos --settings json
+
+# Suppress the settings block in automated pipelines
+memoramotion ./input_photos --settings off
 
 # Video clips only, muted, full grade treatment
 memoramotion "Photos/Videotest" --format 9x16

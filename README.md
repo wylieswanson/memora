@@ -132,6 +132,7 @@ memoramotion ./input_photos
 | --youtube-tags | empty | Comma-separated YouTube tags |
 | --youtube-category | 22 | YouTube category ID |
 | --youtube-privacy | private | private, public, unlisted |
+| --settings | on | Show resolved settings before rendering: `on` (human-readable block), `off` (suppress), `json` (machine-readable) |
 
 ## Output targets and quality
 
@@ -215,6 +216,30 @@ memoramotion \
 
 # Render and import finished videos into macOS Photos
 memoramotion ./input_photos --add-to-photos
+
+# Inspect resolved settings without rendering
+memoramotion ./input_photos --format both --resolution 4k --quality youtube --settings on --dry-run
+
+# Emit settings as JSON for scripting
+memoramotion ./input_photos --quality youtube --settings json | python3 -m json.tool
+
+# Suppress the settings block (e.g. in automated pipelines)
+memoramotion ./input_photos --settings off
+```
+
+The `--settings on` block (the default) is printed before any media work and shows every resolved value, including derived fps, bitrate, Ken Burns strength, and target pixel dimensions:
+
+```
+Memora Motion 0.1.0
+  source:   ./input_photos
+  output:   ./Renders  workdir=./.work_pngs
+  format:   both  [16x9 3840×2160  9x16 2160×3840]
+  quality:  youtube  fps=30  bitrate=45M  encoder=h264_videotoolbox  dry_run=False
+  timing:   sec=2.8  xfade=0.7  transition=auto  rhythm=0.12  sort=natural  seed=0
+  motion:   none  ken=0.0000  parallax=0px  engine=fit-overlay  smart_focus=False
+  clips:    grade=full  audio=mute
+  audio:    (none)  offset=0.0s
+  actions:  (none)
 ```
 
 ---
