@@ -2037,6 +2037,13 @@ def _slug(value: str) -> str:
     return token or "unnamed"
 
 
+def _dur_token(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s >= 60:
+        return f"dur{s // 60}m{s % 60:02d}s"
+    return f"dur{s}s"
+
+
 def build_targets(
     fmt: str,
     stamp: str,
@@ -2046,23 +2053,42 @@ def build_targets(
     photo_count: int,
     clip_count: int = 0,
     resolution: str = "1080p",
+    motion_style: str = "none",
+    fps_override: Optional[int] = None,
+    sort_by: str = "natural",
+    ken_burns_engine: str = "fit-overlay",
+    total_duration: Optional[float] = None,
 ):
     """Build render targets using the agreed deterministic filename schema.
 
     Count suffix: n{photo_count} for photo-only renders; n{photo_count}c{clip_count} when clips are present.
+    Optional tokens appear only when non-default: _fps<n>, _sort-<mode>, _kb-<engine> (ken burns only).
+    _m-<motion> is always present. _dur<n> appears when total_duration is provided.
     """
     count_str = f"n{photo_count}c{clip_count}" if clip_count > 0 else f"n{photo_count}"
     slug = _slug(input_dir_name)
     res = _slug(normalize_resolution(resolution))
     q = _slug(quality)
     tr = _slug(transition)
+    motion = _slug(motion_style)
+
+    optional = f"_m-{motion}"
+    if motion_style in ("kenburns", "both"):
+        optional += f"_kb-{_slug(ken_burns_engine)}"
+    if fps_override is not None:
+        optional += f"_fps{fps_override}"
+    if sort_by != "natural":
+        optional += f"_sort-{_slug(sort_by)}"
+    if total_duration is not None:
+        optional += f"_{_dur_token(total_duration)}"
+
     targets = []
     if fmt in ("16x9", "both"):
         width, height = dimensions_for_target("16x9", res)
-        targets.append((f"{stamp}_{slug}_fmt16x9_res{res}_q{q}_transition-{tr}_{count_str}.mp4", width, height))
+        targets.append((f"{stamp}_{slug}_16x9_{res}_q{q}_t-{tr}_{count_str}{optional}.mp4", width, height))
     if fmt in ("9x16", "both"):
         width, height = dimensions_for_target("9x16", res)
-        targets.append((f"{stamp}_{slug}_fmt9x16_res{res}_q{q}_transition-{tr}_{count_str}.mp4", width, height))
+        targets.append((f"{stamp}_{slug}_9x16_{res}_q{q}_t-{tr}_{count_str}{optional}.mp4", width, height))
     return targets
 
 
@@ -2237,12 +2263,12 @@ def infer_input_dir_for_upload(upload_only_path: Path, source_dir: Optional[str]
         return Path(source_dir)
 
     stem = upload_only_path.stem
-    marker = "_fmt"
-    if marker in stem:
-        prefix = stem.split(marker, 1)[0]
-        parts = prefix.split("_", 1)
-        if len(parts) == 2 and parts[1]:
-            return Path(parts[1])
+    for marker in ("_16x9", "_9x16", "_fmt"):
+        if marker in stem:
+            prefix = stem.split(marker, 1)[0]
+            parts = prefix.split("_", 1)
+            if len(parts) == 2 and parts[1]:
+                return Path(parts[1])
     return upload_only_path.parent
 
 
@@ -2769,6 +2795,8 @@ def write_render_manifest(
 def build_settings_only_plan(args, resolution: str) -> List[dict]:
     stamp = "<timestamp>"
     input_name = Path(args.source_dir).name if args.source_dir else "<source-folder>"
+    preset_fps = QUALITY_PRESETS[args.quality]["fps"]
+    fps_override = args.fps if getattr(args, "fps", None) is not None and args.fps != preset_fps else None
     targets = build_targets(
         args.format,
         stamp,
@@ -2778,13 +2806,18 @@ def build_settings_only_plan(args, resolution: str) -> List[dict]:
         photo_count=0,
         clip_count=0,
         resolution=resolution,
+        motion_style=getattr(args, "motion_style", "none"),
+        fps_override=fps_override,
+        sort_by=getattr(args, "sort_by", "natural"),
+        ken_burns_engine=getattr(args, "ken_burns_engine", "fit-overlay"),
+        total_duration=None,
     )
     return [
         {
-            "format": "16x9" if "fmt16x9" in name else "9x16",
+            "format": "16x9" if "_16x9_" in name else "9x16",
             "width": width,
             "height": height,
-            "filename_pattern": name.replace("_n0.mp4", "_n<photos>[c<clips>].mp4"),
+            "filename_pattern": name.replace("_n0_", "_n<photos>[c<clips>]_"),
         }
         for name, width, height in targets
     ]
@@ -3040,6 +3073,11 @@ def _phase_prep(
     targets = build_targets(
         args.format, stamp, src.name, args.quality, transition_label_for_output(args),
         n_photos, n_clips, resolution=resolution,
+        motion_style=args.motion_style,
+        fps_override=args.fps,
+        sort_by=args.sort_by,
+        ken_burns_engine=args.ken_burns_engine,
+        total_duration=estimated_total,
     )
 
     transition_names = [

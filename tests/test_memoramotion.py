@@ -275,8 +275,8 @@ class MemoraMotionTests(unittest.TestCase):
         self.assertEqual(
             names,
             [
-                "20260315-214501_input-photos_fmt16x9_res1080p_qstandard_transition-fade_n12.mp4",
-                "20260315-214501_input-photos_fmt9x16_res1080p_qstandard_transition-fade_n12.mp4",
+                "20260315-214501_input-photos_16x9_1080p_qstandard_t-fade_n12_m-none.mp4",
+                "20260315-214501_input-photos_9x16_1080p_qstandard_t-fade_n12_m-none.mp4",
             ],
         )
 
@@ -294,8 +294,8 @@ class MemoraMotionTests(unittest.TestCase):
         self.assertEqual(
             targets,
             [
-                ("20260315-214501_input-photos_fmt16x9_res4k_qyoutube_transition-fade_n12.mp4", 3840, 2160),
-                ("20260315-214501_input-photos_fmt9x16_res4k_qyoutube_transition-fade_n12.mp4", 2160, 3840),
+                ("20260315-214501_input-photos_16x9_4k_qyoutube_t-fade_n12_m-none.mp4", 3840, 2160),
+                ("20260315-214501_input-photos_9x16_4k_qyoutube_t-fade_n12_m-none.mp4", 2160, 3840),
             ],
         )
 
@@ -1395,7 +1395,7 @@ class MemoraMotionTests(unittest.TestCase):
             clip_count=2,
         )
         names = [name for name, *_ in targets]
-        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_res1080p_qstandard_transition-fade_n10c2.mp4"])
+        self.assertEqual(names, ["20260315-214501_trip-photos_16x9_1080p_qstandard_t-fade_n10c2_m-none.mp4"])
 
     def test_build_targets_photo_only_omits_c_suffix(self):
         targets = vps.build_targets(
@@ -1407,7 +1407,7 @@ class MemoraMotionTests(unittest.TestCase):
             photo_count=12,
         )
         names = [name for name, *_ in targets]
-        self.assertEqual(names, ["20260315-214501_trip-photos_fmt16x9_res1080p_qstandard_transition-fade_n12.mp4"])
+        self.assertEqual(names, ["20260315-214501_trip-photos_16x9_1080p_qstandard_t-fade_n12_m-none.mp4"])
 
     # -----------------------------------------------------------------------
     # build_media_durations — clip_max_sec

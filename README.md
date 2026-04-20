@@ -23,9 +23,10 @@ From a directory of photos and/or video clips, the app renders one or both aspec
 | `8k` / `4320p` | 7680x4320 | 4320x7680 | Experimental; slow renders and very large files |
 
 Output naming is deterministic and includes run identity fields:
-- Renders/<timestamp>_<input-folder>_fmt16x9_res<resolution>_q<quality>_transition-<transition>_n<photos>.mp4
-- Renders/<timestamp>_<input-folder>_fmt9x16_res<resolution>_q<quality>_transition-<transition>_n<photos>.mp4
+- Renders/<timestamp>_<input-folder>_16x9_<resolution>_q<quality>_t-<transition>_n<photos>_m-<motion>[_kb-<engine>][_fps<fps>][_sort-<sort>]_dur<duration>.mp4
+- Renders/<timestamp>_<input-folder>_9x16_<resolution>_q<quality>_t-<transition>_n<photos>_m-<motion>[_kb-<engine>][_fps<fps>][_sort-<sort>]_dur<duration>.mp4
 
+Optional tokens appear only when non-default: `_kb-<engine>` (ken burns only), `_fps<n>` (custom `--fps`), `_sort-<mode>` (non-natural sort).
 When video clips are present the count suffix includes both: `_n10c2` means 10 photos and 2 clips.
 
 ---
@@ -243,7 +244,7 @@ memoramotion ./input_photos \
 
 # Upload an existing render without re-rendering
 memoramotion \
-  --youtube-upload-file ./Renders/20260322-194059_lorena-climbing-prescott_fmt16x9_res1080p_qstandard_transition-auto_n12.mp4 \
+  --youtube-upload-file ./Renders/20260322-194059_lorena-climbing-prescott_16x9_1080p_qstandard_t-auto_n12_m-none_dur3m42s.mp4 \
   --youtube-title "{filename}" \
   --youtube-description "Fresh slideshow render" \
   --youtube-tags "travel,arizona,slideshow"

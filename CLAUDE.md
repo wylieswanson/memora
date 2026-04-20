@@ -5,7 +5,7 @@
 **Memora Motion** — an installable Python CLI tool that turns folders of photos and video clips into polished slideshow videos in 16x9 and 9x16 formats. Main executable: `memoramotion`; implementation module: `memoramotion.py`. No web server, no database, no framework.
 
 Key output characteristics:
-- Deterministic, descriptive filenames: `<timestamp>_<folder>_fmt<format>_res<resolution>_q<quality>_transition-<transition>_n<photos>[c<clips>].mp4` — `c<clips>` suffix only appears when video clips are present
+- Deterministic, descriptive filenames: `<timestamp>_<folder>_<format>_<resolution>_q<quality>_t-<transition>_n<photos>[c<clips>]_m-<motion>[_kb-<engine>][_fps<n>][_sort-<mode>]_dur<duration>.mp4` — `c<clips>` suffix only when clips present; `_kb-`, `_fps`, `_sort-` only when non-default
 - Both aspect ratios rendered in one pass by default
 - Resolution presets cover 1080p, 1440p, 4K/2160p, and experimental 8K/4320p
 - All visual effects (filmic grade, vignette, grain, Ken Burns, parallax) composed in FFmpeg filter graphs
