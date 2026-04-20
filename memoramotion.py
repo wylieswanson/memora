@@ -32,6 +32,18 @@ APP_NAME = "Memora Motion"
 APP_VERSION = "0.1.0"
 USER_AGENT = f"memoramotion/{APP_VERSION} (Memora Motion slideshow tool)"
 
+
+def configure_mediapipe_runtime_env() -> None:
+    # These must be set before the first mediapipe import. setdefault lets callers
+    # opt back into verbose native logs from the shell when debugging MediaPipe.
+    os.environ.setdefault("GLOG_minloglevel", "2")
+    os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+
+
+configure_mediapipe_runtime_env()
+
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".heic", ".heif"}
 VID_EXTS = {".mp4", ".mov"}
 
@@ -439,10 +451,7 @@ def _get_configured_smart_focus_models() -> Tuple[Path, Path]:
 
 
 def _get_mediapipe_task_modules() -> Tuple[Any, Any, Any]:
-    # Must be set before the first mediapipe import; setdefault lets callers override from shell.
-    os.environ.setdefault("GLOG_minloglevel", "2")       # suppress GLOG INFO/WARNING from MediaPipe C++ internals
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # suppress TFLite "Created XNNPACK delegate" lines
-    os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")  # prevent Metal/GL context init; we use cpu_delegate anyway
+    configure_mediapipe_runtime_env()
     try:
         mp = importlib.import_module("mediapipe")
         mp_python = importlib.import_module("mediapipe.tasks.python")
@@ -1002,7 +1011,14 @@ def convert_to_pngs(
 
     if len(image_files) > 3:
         auto_workers = min(len(image_files), max(2, min(cpu_count(), 6)))
-        workers = auto_workers if max_workers <= 0 else max(1, min(len(image_files), max_workers))
+        if detect_focus and max_workers <= 0:
+            workers = 1
+        else:
+            workers = auto_workers if max_workers <= 0 else max(1, min(len(image_files), max_workers))
+    else:
+        workers = 1
+
+    if len(image_files) > 3 and workers > 1:
         initializer = _init_mediapipe_worker if detect_focus else None
         initargs = tuple(str(p) for p in smart_focus_models) if detect_focus else ()
         with Pool(workers, initializer=initializer, initargs=initargs) as pool:

@@ -410,6 +410,33 @@ class MemoraMotionTests(unittest.TestCase):
         mock_preflight.assert_called_once()
         mock_pool.assert_not_called()
 
+    def test_convert_to_pngs_uses_serial_smart_focus_by_default(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            work = tmp_path / "work"
+            for i in range(4):
+                Image.new("RGB", (10, 10), color="white").save(tmp_path / f"{i}.jpg")
+
+            def fake_convert(args_tuple):
+                _src, idx, work_dir, _extract_exif, _detect_focus = args_tuple
+                return idx, work_dir / f"{idx:06d}.png", None, None
+
+            with patch("memoramotion.preflight_smart_focus_runtime") as mock_preflight, \
+                 patch("memoramotion._convert_single_image", side_effect=fake_convert) as mock_convert, \
+                 patch("memoramotion.Pool") as mock_pool:
+                paths, infos, _src_to_png = vps.convert_to_pngs(
+                    tmp_path,
+                    work,
+                    detect_focus=True,
+                    smart_focus_models=(tmp_path / "face.tflite", tmp_path / "pose.task"),
+                )
+
+        mock_preflight.assert_called_once()
+        mock_pool.assert_not_called()
+        self.assertEqual(mock_convert.call_count, 4)
+        self.assertEqual(len(paths), 4)
+        self.assertEqual(infos, [None, None, None, None])
+
     def test_smart_focus_parses_tasks_face_detection_result(self):
         detection = SimpleNamespace(
             categories=[SimpleNamespace(score=0.9)],
