@@ -106,7 +106,7 @@ memoramotion ./input_photos
 | --xfade | 0.7 | Crossfade duration |
 | --transition | auto | Transition mode or explicit ffmpeg xfade transition |
 | --rhythm-strength | 0.12 | Pacing variation strength (0.0 to 0.25) |
-| --motion-style | none | none, kenburns, parallax, both |
+| --motion-style | auto | auto, none, kenburns, parallax, both |
 | --ken-burns-strength | auto | Override Ken Burns strength (0.0 to 0.03) |
 | --ken-burns-engine | auto | auto uses fit-overlay normally and fixed-viewport with --smart-focus; explicit: fit-overlay, preserve-stage, fixed-viewport |
 | --parallax-px | auto | Override parallax amplitude in pixels |
@@ -189,14 +189,14 @@ memoramotion ./input_photos --format both --resolution 4k --quality youtube
 # Absolute max preset; expect long renders and very large files
 memoramotion ./input_photos --format 16x9 --resolution 8k --quality max
 
-# Ken Burns with subject-aware framing
-memoramotion ./input_photos --motion-style kenburns --smart-focus
+# Subject-aware Ken Burns
+memoramotion ./input_photos --smart-focus
 
 # Stable-foreground Ken Burns is automatic with smart focus
-memoramotion ./input_photos --motion-style kenburns --smart-focus --ken-burns-engine fixed-viewport
+memoramotion ./input_photos --smart-focus --ken-burns-engine fixed-viewport
 
 # Full-photo-preserving Ken Burns comparison mode
-memoramotion ./input_photos --motion-style kenburns --smart-focus --ken-burns-engine preserve-stage
+memoramotion ./input_photos --smart-focus --ken-burns-engine preserve-stage
 
 # Render and upload to YouTube as private
 memoramotion ./input_photos \
@@ -265,12 +265,13 @@ Ken Burns motion:
 - `fixed-viewport` keeps the foreground photo footprint fixed and zooms/pans the image content inside it. This is usually the cleanest smart-focus Ken Burns look, but it can crop during the zoom because the outer photo bounds do not move.
 - All Ken Burns engines use smooth ease-in/out (quintic Hermite curve) over each shot.
 - `--ken-burns-strength` controls the total zoom range per shot (0.0–0.03); default is auto-scaled to shot duration.
-- When `--smart-focus` is active with Ken Burns motion and no engine is specified, Memora Motion automatically uses `fixed-viewport`. Explicit `--ken-burns-engine` values always win.
+- `--motion-style auto` resolves to `none` normally and to `kenburns` when `--smart-focus` is enabled.
+- When `--smart-focus` enables Ken Burns and no engine is specified, Memora Motion automatically uses `fixed-viewport`. Explicit `--motion-style` and `--ken-burns-engine` values always win.
 
 Smart focus:
 - `--smart-focus` is a clean v1 subject-targeting mode for Ken Burns.
 - It uses MediaPipe Tasks face detection first, pose landmark fallback second, and otherwise falls back to center framing.
-- It currently activates when `--motion-style` is `kenburns` or `both`.
+- With the default `--motion-style auto`, it enables Ken Burns automatically. If you explicitly set `--motion-style`, use `kenburns` or `both`.
 - Default model assets are cached in `./.mediapipe_models`; use `--smart-focus-face-model` and `--smart-focus-pose-model` for manually downloaded or alternate models.
 
 Sort modes:

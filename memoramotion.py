@@ -7,6 +7,7 @@ A practical CLI for turning photo folders into polished slideshow videos.
 import argparse
 import importlib
 import json
+import os
 import math
 import random
 import re
@@ -69,6 +70,7 @@ MOTION_PRESETS = {
     "parallax": {"ken": 0.0, "parallax_ratio": 0.0028, "description": "Very subtle depth drift"},
     "both": {"ken": 0.0015, "parallax_ratio": 0.0028, "description": "Subtle eased zoom plus depth drift"},
 }
+MOTION_STYLE_CHOICES = ["auto", "none", "kenburns", "parallax", "both"]
 
 # Curated transition set for modern, restrained motion language.
 PRO_TRANSITIONS = ["fade", "smoothleft", "smoothright"]
@@ -124,6 +126,7 @@ KEN_BURNS_ENGINE_ALIASES = {"fixed-frame": "preserve-stage"}
 KEN_BURNS_FOCUS_BIAS = 0.35
 KEN_BURNS_STAGE_MARGIN_MIN = 0.03
 KEN_BURNS_STAGE_MARGIN_RATIO = 0.30
+_STILL_GRADE_CHAIN = "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,vignette=PI/10,noise=alls=3:allf=t+u"
 
 
 @dataclass
@@ -264,6 +267,21 @@ def clamp(value: float, lo: float, hi: float) -> float:
 def _ffmpeg_number(value: float) -> str:
     text = f"{value:.6f}".rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
+
+
+def resolve_motion_style(motion_style: str, smart_focus: bool) -> str:
+    normalized = motion_style.strip().lower()
+    if normalized == "auto":
+        return "kenburns" if smart_focus else "none"
+    if normalized not in MOTION_PRESETS:
+        supported = ", ".join(MOTION_STYLE_CHOICES)
+        raise argparse.ArgumentTypeError(f"must be one of: {supported}")
+    if smart_focus and normalized not in ("kenburns", "both"):
+        raise argparse.ArgumentTypeError(
+            "--smart-focus only affects Ken Burns motion. Use --motion-style kenburns "
+            "or --motion-style both, or remove --smart-focus."
+        )
+    return normalized
 
 
 def normalize_ken_burns_engine(engine: str) -> str:
@@ -421,6 +439,10 @@ def _get_configured_smart_focus_models() -> Tuple[Path, Path]:
 
 
 def _get_mediapipe_task_modules() -> Tuple[Any, Any, Any]:
+    # Must be set before the first mediapipe import; setdefault lets callers override from shell.
+    os.environ.setdefault("GLOG_minloglevel", "2")       # suppress GLOG INFO/WARNING from MediaPipe C++ internals
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # suppress TFLite "Created XNNPACK delegate" lines
+    os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")  # prevent Metal/GL context init; we use cpu_delegate anyway
     try:
         mp = importlib.import_module("mediapipe")
         mp_python = importlib.import_module("mediapipe.tasks.python")
@@ -798,7 +820,7 @@ def parse_gps_coord(gps_ref, gps_data):
         if gps_ref in ("S", "W"):
             coord = -coord
         return coord
-    except Exception:
+    except (TypeError, IndexError, ZeroDivisionError):
         return None
 
 
@@ -902,7 +924,8 @@ def get_image_metadata(img_path: Path, image: Image.Image, extract_exif: bool, d
             camera_model=model,
             focal_point=focal_point,
         )
-    except Exception:
+    except Exception as e:
+        print(f"Warning: could not read metadata from {img_path.name}: {e}", file=sys.stderr)
         return None
 
 
@@ -1161,6 +1184,91 @@ def create_label_overlay_png(
     img.save(str(path), "PNG")
 
 
+def _bg_still(i: int, width: int, height: int, blur_strength: int, fps: int, sec: float) -> str:
+    return (
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+        f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
+        f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
+    )
+
+
+def _filter_still_no_motion(
+    i: int, width: int, height: int, fps: int, sec: float,
+    blur_strength: int, parallax_px: int, ease: str, scale_flags: str,
+    local_rng: random.Random,
+) -> str:
+    bg = _bg_still(i, width, height, blur_strength, fps, sec)
+    fg = (
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},"
+        f"setsar=1,fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
+    )
+    if parallax_px > 0:
+        drift = f"{local_rng.choice([-1, 1]) * parallax_px}*({ease}-0.5)"
+        overlay = f"overlay=x='(W-w)/2+({drift})':y='(H-h)/2'"
+    else:
+        overlay = "overlay=(W-w)/2:(H-h)/2"
+    comp = f"[bg{i}][fg{i}]{overlay},{_STILL_GRADE_CHAIN},format=yuv420p[v{i}]"
+    return ";\n".join([bg, fg, comp])
+
+
+def _filter_still_fit_overlay(
+    i: int, width: int, height: int, fps: int, sec: float,
+    scale_flags: str, bg: str, zoom: str, focus_x_s: str, focus_y_s: str,
+) -> str:
+    # Foreground: normalize cadence then animate zoom so ffmpeg evaluates
+    # motion on the exact output frame timeline.
+    fg = (
+        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},setsar=1,"
+        f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS,"
+        f"scale=w='iw*{zoom}':h='ih*{zoom}':eval=frame{scale_flags},"
+        f"setsar=1[fg{i}]"
+    )
+    # Overlay: anchor focal point at its fitted-frame position while zooming,
+    # so motion reads as zooming into the subject rather than panning.
+    pan_x = f"(({width}-(w/{zoom}))/2)+({focus_x_s}*(w/{zoom}))-({focus_x_s}*w)"
+    pan_y = f"(({height}-(h/{zoom}))/2)+({focus_y_s}*(h/{zoom}))-({focus_y_s}*h)"
+    comp = f"[bg{i}][fg{i}]overlay=x='{pan_x}':y='{pan_y}',{_STILL_GRADE_CHAIN},format=yuv420p[v{i}]"
+    return ";\n".join([bg, fg, comp])
+
+
+def _filter_still_fixed_viewport(
+    i: int, width: int, height: int, fps: int, sec: float,
+    source_size: Optional[Tuple[int, int]], scale_flags: str, bg: str,
+    zoom: str, pan_x: str, pan_y: str, frame_count: int,
+) -> str:
+    viewport_w, viewport_h = _fit_viewport_dimensions(width, height, source_size)
+    fg = (
+        f"[{i}:v]scale={viewport_w}:{viewport_h}:force_original_aspect_ratio=decrease{scale_flags},"
+        f"format=rgba,pad={viewport_w}:{viewport_h}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1,"
+        "trim=end_frame=1,setpts=PTS-STARTPTS,"
+        f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frame_count}:s={viewport_w}x{viewport_h}:fps={fps},"
+        f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+        f"trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
+    )
+    comp = f"[bg{i}][fg{i}]overlay=0:0:format=auto,{_STILL_GRADE_CHAIN},format=yuv420p[v{i}]"
+    return ";\n".join([bg, fg, comp])
+
+
+def _filter_still_preserve_stage(
+    i: int, width: int, height: int, fps: int, sec: float,
+    scale_flags: str, bg: str, zoom: str, pan_x: str, pan_y: str,
+    frame_count: int, zoom_delta: float, start_zoom: float, end_zoom: float,
+) -> str:
+    stage_margin = max(KEN_BURNS_STAGE_MARGIN_MIN, zoom_delta * KEN_BURNS_STAGE_MARGIN_RATIO)
+    stage_divisor = max(start_zoom, end_zoom) + stage_margin
+    stage_w = _even_dimension(width / stage_divisor)
+    stage_h = _even_dimension(height / stage_divisor)
+    fg = (
+        f"[{i}:v]scale={stage_w}:{stage_h}:force_original_aspect_ratio=decrease{scale_flags},"
+        f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1,"
+        "trim=end_frame=1,setpts=PTS-STARTPTS,"
+        f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frame_count}:s={width}x{height}:fps={fps},"
+        f"trim=duration={sec},setpts=PTS-STARTPTS,format=rgba[fg{i}]"
+    )
+    comp = f"[bg{i}][fg{i}]overlay=0:0:format=auto,{_STILL_GRADE_CHAIN},format=yuv420p[v{i}]"
+    return ";\n".join([bg, fg, comp])
+
+
 def build_filter_for_still(
     i: int,
     width: int,
@@ -1179,110 +1287,39 @@ def build_filter_for_still(
     local_rng = random.Random(motion_seed + i * 101)
     scale_flags = ":flags=lanczos" if use_lanczos else ""
     ken_burns_engine = normalize_ken_burns_engine(ken_burns_engine)
-
     u = f"(t/{sec})"
     ease = _ken_burns_ease_expr(u)
-    if ken_strength > 0:
-        focus_x, focus_y, has_subject_target = _biased_focus(focal_point)
-        zoom_delta = _ken_burns_zoom_delta(ken_strength, sec, has_subject_target)
-        zoom_in = local_rng.random() >= 0.5
-        start_zoom = 1.0 if zoom_in else 1.0 + zoom_delta
-        end_zoom = 1.0 + zoom_delta if zoom_in else 1.0
-        start_zoom_s = _ffmpeg_number(start_zoom)
-        end_zoom_s = _ffmpeg_number(end_zoom)
-        focus_x_s = _ffmpeg_number(focus_x)
-        focus_y_s = _ffmpeg_number(focus_y)
+
+    if ken_strength == 0:
+        return _filter_still_no_motion(i, width, height, fps, sec, blur_strength, parallax_px, ease, scale_flags, local_rng)
+
+    focus_x, focus_y, has_subject_target = _biased_focus(focal_point)
+    zoom_delta = _ken_burns_zoom_delta(ken_strength, sec, has_subject_target)
+    zoom_in = local_rng.random() >= 0.5
+    start_zoom = 1.0 if zoom_in else 1.0 + zoom_delta
+    end_zoom = 1.0 + zoom_delta if zoom_in else 1.0
+    start_zoom_s = _ffmpeg_number(start_zoom)
+    end_zoom_s = _ffmpeg_number(end_zoom)
+    focus_x_s = _ffmpeg_number(focus_x)
+    focus_y_s = _ffmpeg_number(focus_y)
+    bg = _bg_still(i, width, height, blur_strength, fps, sec)
+
+    if ken_burns_engine == "fit-overlay":
+        # Time-based easing: zoom expression evaluated per output frame via scale eval=frame.
         zoom = f"({start_zoom_s}*pow(({end_zoom_s}/{start_zoom_s}),{ease}))"
+        return _filter_still_fit_overlay(i, width, height, fps, sec, scale_flags, bg, zoom, focus_x_s, focus_y_s)
 
-        # Background: blurred fill, same as the no-motion path; ensures portrait photos
-        # in landscape output (and any other aspect mismatch) always have a blurred backdrop.
-        bg = (
-            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-            f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
-            f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
-        )
+    # zoompan engines: easing uses frame counter (on) rather than time (t).
+    frame_count = max(1, int(round(sec * fps)))
+    on_max = max(1, frame_count - 1)
+    zoom_ease = _ken_burns_ease_expr(f"(on/{on_max})")
+    zoom = f"({start_zoom_s}*pow(({end_zoom_s}/{start_zoom_s}),{zoom_ease}))"
+    pan_x = f"min(max(({focus_x_s}*iw)-(iw/zoom/2),0),iw-(iw/zoom))"
+    pan_y = f"min(max(({focus_y_s}*ih)-(ih/zoom/2),0),ih-(ih/zoom))"
 
-        if ken_burns_engine in ("preserve-stage", "fixed-viewport"):
-            frame_count = max(1, int(round(sec * fps)))
-            on_max = max(1, frame_count - 1)
-            zoom_progress = f"(on/{on_max})"
-            zoom_ease = _ken_burns_ease_expr(zoom_progress)
-            zoom = f"({start_zoom_s}*pow(({end_zoom_s}/{start_zoom_s}),{zoom_ease}))"
-            pan_x = f"min(max(({focus_x_s}*iw)-(iw/zoom/2),0),iw-(iw/zoom))"
-            pan_y = f"min(max(({focus_y_s}*ih)-(ih/zoom/2),0),ih-(ih/zoom))"
-            if ken_burns_engine == "fixed-viewport":
-                viewport_w, viewport_h = _fit_viewport_dimensions(width, height, source_size)
-                fg = (
-                    f"[{i}:v]scale={viewport_w}:{viewport_h}:force_original_aspect_ratio=decrease{scale_flags},"
-                    f"format=rgba,pad={viewport_w}:{viewport_h}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1,"
-                    "trim=end_frame=1,setpts=PTS-STARTPTS,"
-                    f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frame_count}:s={viewport_w}x{viewport_h}:fps={fps},"
-                    f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
-                    f"trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
-                )
-            else:
-                stage_margin = max(KEN_BURNS_STAGE_MARGIN_MIN, zoom_delta * KEN_BURNS_STAGE_MARGIN_RATIO)
-                stage_divisor = max(start_zoom, end_zoom) + stage_margin
-                stage_w = _even_dimension(width / stage_divisor)
-                stage_h = _even_dimension(height / stage_divisor)
-                fg = (
-                    f"[{i}:v]scale={stage_w}:{stage_h}:force_original_aspect_ratio=decrease{scale_flags},"
-                    f"format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,setsar=1,"
-                    "trim=end_frame=1,setpts=PTS-STARTPTS,"
-                    f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frame_count}:s={width}x{height}:fps={fps},"
-                    f"trim=duration={sec},setpts=PTS-STARTPTS,format=rgba[fg{i}]"
-                )
-            comp = (
-                f"[bg{i}][fg{i}]overlay=0:0:format=auto,"
-                "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
-                "vignette=PI/10,"
-                "noise=alls=3:allf=t+u,"
-                f"format=yuv420p[v{i}]"
-            )
-            return ";\n".join([bg, fg, comp])
-
-        # Foreground: first normalize cadence for the still, then animate zoom
-        # so ffmpeg evaluates motion on the exact output frame timeline.
-        fg = (
-            f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},setsar=1,"
-            f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS,"
-            f"scale=w='iw*{zoom}':h='ih*{zoom}':eval=frame{scale_flags},"
-            f"setsar=1[fg{i}]"
-        )
-        # Overlay: keep the chosen focal point anchored at its neutral fitted-frame
-        # position while the foreground zooms. This reads as zooming into/out from
-        # the subject instead of sliding the entire photo across the background.
-        pan_x = f"(({width}-(w/{zoom}))/2)+({focus_x_s}*(w/{zoom}))-({focus_x_s}*w)"
-        pan_y = f"(({height}-(h/{zoom}))/2)+({focus_y_s}*(h/{zoom}))-({focus_y_s}*h)"
-        comp = (
-            f"[bg{i}][fg{i}]overlay=x='{pan_x}':y='{pan_y}',"
-            "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
-            "vignette=PI/10,"
-            "noise=alls=3:allf=t+u,"
-            f"format=yuv420p[v{i}]"
-        )
-        return ";\n".join([bg, fg, comp])
-
-    bg = (
-        f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-        f"boxblur={blur_strength}:1,eq=brightness=-0.04:saturation=1.08,"
-        f"fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[bg{i}]"
-    )
-    fg = f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease{scale_flags},setsar=1,fps={fps},trim=duration={sec},setpts=PTS-STARTPTS[fg{i}]"
-    if parallax_px > 0:
-        parallax_drift = f"{local_rng.choice([-1, 1]) * parallax_px}*({ease}-0.5)"
-        overlay = f"overlay=x='(W-w)/2+({parallax_drift})':y='(H-h)/2'"
-    else:
-        overlay = "overlay=(W-w)/2:(H-h)/2"
-
-    comp = (
-        f"[bg{i}][fg{i}]{overlay},"
-        "eq=contrast=1.05:brightness=0.01:saturation=1.04:gamma=0.98,"
-        "vignette=PI/10,"
-        "noise=alls=3:allf=t+u,"
-        f"format=yuv420p[v{i}]"
-    )
-    return ";\n".join([bg, fg, comp])
+    if ken_burns_engine == "fixed-viewport":
+        return _filter_still_fixed_viewport(i, width, height, fps, sec, source_size, scale_flags, bg, zoom, pan_x, pan_y, frame_count)
+    return _filter_still_preserve_stage(i, width, height, fps, sec, scale_flags, bg, zoom, pan_x, pan_y, frame_count, zoom_delta, start_zoom, end_zoom)
 
 
 def build_filter_for_clip(
@@ -1721,7 +1758,8 @@ def parse_args():
                     help="Print per-photo location labels (implies --geocode)")
     ap.add_argument("--location-overlay", action="store_true",
                     help="Burn location labels into the video as text (implies --geocode)")
-    ap.add_argument("--motion-style", default="none", choices=["none", "kenburns", "parallax", "both"])
+    ap.add_argument("--motion-style", default="auto", choices=MOTION_STYLE_CHOICES,
+                    help="Motion style: auto, none, kenburns, parallax, or both")
     ap.add_argument("--ken-burns-strength", type=float, default=None)
     ap.add_argument("--ken-burns-engine", default=None, type=normalize_ken_burns_engine,
                     choices=KEN_BURNS_ENGINE_CHOICES,
@@ -1882,7 +1920,8 @@ def _nominatim_reverse(lat: float, lon: float) -> Optional[dict]:
             data = json.loads(resp.read().decode())
         _GEOCODE_CACHE[cache_key] = data
         return data
-    except Exception:
+    except (OSError, ValueError) as e:
+        print(f"Warning: geocode request failed for ({lat:.4f}, {lon:.4f}): {type(e).__name__}: {e}", file=sys.stderr)
         _GEOCODE_CACHE[cache_key] = None
         return None
 
@@ -2183,13 +2222,20 @@ def _validate_args(args) -> None:
     if args.ken_burns_strength is not None and not (0.0 <= args.ken_burns_strength <= 0.03):
         raise SystemExit("--ken-burns-strength must be between 0.0 and 0.03")
     try:
+        args.motion_style = resolve_motion_style(
+            getattr(args, "motion_style", "auto"),
+            bool(getattr(args, "smart_focus", False)),
+        )
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(str(exc)) from exc
+    try:
         args.ken_burns_engine = resolve_ken_burns_engine(
             getattr(args, "ken_burns_engine", None),
             bool(getattr(args, "smart_focus", False)),
-            getattr(args, "motion_style", "none"),
+            args.motion_style,
         )
     except argparse.ArgumentTypeError as exc:
-        raise SystemExit(f"--ken-burns-engine {exc}") from exc
+        raise SystemExit(str(exc)) from exc
     if args.parallax_px is not None and args.parallax_px < 0:
         raise SystemExit("--parallax-px must be >= 0")
     if getattr(args, "smart_focus_face_model", None) and not Path(args.smart_focus_face_model).expanduser().is_file():
@@ -2216,6 +2262,9 @@ def _validate_args(args) -> None:
         raise SystemExit("--fps must be at least 12")
     if args.bitrate is not None and not re.match(r'^\d+[kKmMgG]?$', args.bitrate):
         raise SystemExit("--bitrate must be a number with optional unit, e.g. 20M or 8000k")
+    if (args.location_stats or args.location_overlay) and not args.geocode:
+        print("Note: --location-stats/--location-overlay imply --geocode; enabling geocoding", file=sys.stderr)
+        args.geocode = True
 
 
 def _preflight_youtube_upload(
@@ -2345,8 +2394,6 @@ def main():
         do_geocode = args.geocode or args.location_stats or args.location_overlay
         extract_exif = args.sort_by in ("time", "location") or args.camera_stats or do_geocode
         detect_focus = args.smart_focus and args.motion_style in ("kenburns", "both")
-        if args.smart_focus and not detect_focus:
-            print(f"Warning: --smart-focus has no effect with --motion-style {args.motion_style}; use kenburns or both", file=sys.stderr)
         smart_focus_models = None
         if detect_focus:
             smart_focus_model_dir = getattr(args, "smart_focus_model_dir", "./.mediapipe_models")
@@ -2380,6 +2427,8 @@ def main():
             )
 
         n_clips = sum(1 for i in infos if i and i.is_video)
+        if args.clip_audio in ("keep", "duck") and n_clips == 0:
+            print(f"Warning: --clip-audio {args.clip_audio} has no effect; no video clips found in {src}", file=sys.stderr)
         progress_print(args.progress, f"[phase prep] ordering {len(images)} items ({n_clips} video clips) with sort={args.sort_by}")
         images, infos = sort_images_and_infos(images, infos, sort_by=args.sort_by, seed=args.seed)
         if args.camera_stats:

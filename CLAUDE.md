@@ -73,6 +73,7 @@ MOTION_PRESETS = {
     "both":     {"ken": 0.0015, "parallax_ratio": 0.0028},
 }
 
+MOTION_STYLE_CHOICES = ["auto", "none", "kenburns", "parallax", "both"]
 KEN_BURNS_ENGINE_CHOICES = ["fit-overlay", "preserve-stage", "fixed-viewport"]
 PRO_TRANSITIONS = ["fade", "smoothleft", "smoothright"]  # auto mode rotates through these
 ```
@@ -158,7 +159,8 @@ Photos (`.jpg`, `.heic`, etc.) and video clips (`.mp4`, `.mov`) can be mixed fre
 - **Ken Burns / `fit-overlay` engine** (`ken_strength > 0`, default unless smart focus auto-selects `fixed-viewport`): same bg path as no-motion; fg uses `scale (decrease, fit) → fps/trim/setpts → scale (zoom, eval=frame)`. The zoom uses duration-based strength, smootherstep easing, and multiplicative interpolation so higher FPS only improves smoothness instead of increasing zoom distance. Smart-focus points are blended toward center by `KEN_BURNS_FOCUS_BIAS` so they gently bias the zoom instead of dragging the photo.
 - **Ken Burns / `preserve-stage` engine** (`--ken-burns-engine preserve-stage`): full-photo-preserving zoompan path. It fits the foreground into a smaller transparent full-frame stage, uses `zoompan` to animate that fixed-size stage with a small preservation margin, then overlays the full-frame result at `0:0`. This keeps full-photo visibility, but the visible foreground footprint may subtly resize. `fixed-frame` remains accepted as an alias for this engine.
 - **Ken Burns / `fixed-viewport` engine** (`--ken-burns-engine fixed-viewport`): stable-footprint path. It computes the fitted photo viewport from `PhotoInfo` dimensions, keeps that viewport centered and fixed, then uses `zoompan` to zoom/pan content inside it. This is the cleanest smart-focus motion, but it can crop during the zoom.
-- `--ken-burns-engine` defaults to auto: `fit-overlay` normally, `fixed-viewport` when `--smart-focus` is active with `kenburns` or `both`. Explicit engine flags override auto selection.
+- `--motion-style` defaults to auto: `none` normally, `kenburns` when `--smart-focus` is enabled.
+- `--ken-burns-engine` defaults to auto: `fit-overlay` normally, `fixed-viewport` when `--smart-focus` resolves to `kenburns` or explicit `both`. Explicit engine flags override auto selection.
 - Both functions accept `use_lanczos: bool` (set by `build_render_command` when `quality_name` is `high`, `youtube`, or `max`). When true, `:flags=lanczos` is appended to all fg scale filters; the blurred bg scale is unaffected.
 
 **Clips** — `build_filter_for_clip()`:
@@ -200,8 +202,8 @@ memoramotion "Photos/Videotest" --format 9x16
 # Video clips with duck audio (background lowers during clips)
 memoramotion "Photos/Videotest" --format 9x16 --clip-audio duck --audio ./music.mp3
 
-# Vertical only, with Ken Burns and smart subject framing on photos
-memoramotion ./input_photos --format 9x16 --motion-style kenburns --smart-focus
+# Vertical only, with smart subject framing on photos
+memoramotion ./input_photos --format 9x16 --smart-focus
 
 # Practical maximum-quality YouTube render
 memoramotion ./input_photos --format both --resolution 4k --quality youtube

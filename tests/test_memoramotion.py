@@ -35,7 +35,7 @@ def _make_args(**overrides):
         geocode=False,
         location_stats=False,
         location_overlay=False,
-        motion_style="none",
+        motion_style="auto",
         ken_burns_strength=None,
         parallax_px=None,
         smart_focus=False,
@@ -275,6 +275,30 @@ class MemoraMotionTests(unittest.TestCase):
             args = vps.parse_args()
 
         self.assertEqual(args.ken_burns_engine, "preserve-stage")
+
+    def test_validate_args_resolves_motion_auto_without_smart_focus_to_none(self):
+        args = _make_args(motion_style="auto", smart_focus=False)
+
+        vps._validate_args(args)
+
+        self.assertEqual(args.motion_style, "none")
+        self.assertEqual(args.ken_burns_engine, "fit-overlay")
+
+    def test_validate_args_resolves_motion_auto_with_smart_focus_to_kenburns(self):
+        args = _make_args(motion_style="auto", smart_focus=True, ken_burns_engine=None)
+
+        vps._validate_args(args)
+
+        self.assertEqual(args.motion_style, "kenburns")
+        self.assertEqual(args.ken_burns_engine, "fixed-viewport")
+
+    def test_validate_args_rejects_explicit_smart_focus_without_kenburns_motion(self):
+        args = _make_args(motion_style="none", smart_focus=True, ken_burns_engine=None)
+
+        with self.assertRaises(SystemExit) as ctx:
+            vps._validate_args(args)
+
+        self.assertIn("--smart-focus only affects Ken Burns motion", str(ctx.exception))
 
     def test_validate_args_resolves_smart_focus_auto_engine_to_fixed_viewport(self):
         args = _make_args(motion_style="kenburns", smart_focus=True, ken_burns_engine=None)
@@ -815,6 +839,45 @@ class MemoraMotionTests(unittest.TestCase):
         )
         self.assertEqual(result, "[1:a]apad[bg_a];\n[bg_a]anull[aout]")
 
+    def test_build_clip_audio_filters_mixed_audio_clips(self):
+        """Only clips with has_audio=True should contribute audio streams."""
+        def make_clip(has_audio):
+            return vps.PhotoInfo(
+                path=Path("c.mp4"), width=1920, height=1080,
+                aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+                is_video=True, video_duration=5.0, has_audio=has_audio,
+            )
+        result = vps._build_clip_audio_filters(
+            infos_list=[make_clip(True), make_clip(False), make_clip(True)],
+            media_durations=[5.0, 5.0, 5.0],
+            xfade=0.7,
+            audio_input_idx=None,
+            clip_audio="keep",
+        )
+        self.assertIn("[ca0]", result)
+        self.assertIn("[ca1]", result)
+        self.assertNotIn("[ca2]", result)
+        self.assertIn("[aout]", result)
+
+    def test_build_clip_audio_filters_pads_to_total_duration(self):
+        """When total_duration > 0 the output should pad and trim to that length."""
+        clip_info = vps.PhotoInfo(
+            path=Path("c.mp4"), width=1920, height=1080,
+            aspect_ratio=1.78, is_landscape=True, orientation="landscape",
+            is_video=True, video_duration=5.0, has_audio=True,
+        )
+        result = vps._build_clip_audio_filters(
+            infos_list=[clip_info],
+            media_durations=[5.0],
+            xfade=0.7,
+            audio_input_idx=None,
+            clip_audio="keep",
+            total_duration=30.0,
+        )
+        self.assertIn("apad", result)
+        self.assertIn("atrim=duration=30.000000", result)
+        self.assertIn("[aout]", result)
+
     # -----------------------------------------------------------------------
     # RenderConfig
     # -----------------------------------------------------------------------
@@ -1058,7 +1121,7 @@ class MemoraMotionTests(unittest.TestCase):
 
     def test_main_passes_smart_focus_flag_to_collect_and_render(self):
         with TemporaryDirectory() as tmp:
-            args = _make_args(motion_style="kenburns", smart_focus=True, workdir=tmp)
+            args = _make_args(smart_focus=True, workdir=tmp)
             images = [Path("work/000000_a.png")]
             infos = [self._info("a.png")]
             infos[0].focal_point = (0.3, 0.4)
@@ -1091,6 +1154,7 @@ class MemoraMotionTests(unittest.TestCase):
         mock_models.assert_called_once()
         mock_configure.assert_called_once_with(Path(tmp) / "face.tflite", Path(tmp) / "pose.task")
         self.assertEqual(mock_render.call_args.kwargs["focal_points"], [(0.3, 0.4)])
+        self.assertEqual(mock_render.call_args.args[4].motion_style, "kenburns")
         self.assertEqual(mock_render.call_args.args[4].ken_burns_engine, "fixed-viewport")
 
     def test_main_prints_prep_progress_when_enabled(self):
