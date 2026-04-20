@@ -1,6 +1,4 @@
 # Development install.
-# For end users, prefer:
-#   pipx install .
-# or:
-#   python -m pip install .
+# The default project install includes all runtime feature dependencies.
+# For a lightweight source-only environment, use requirements-core.txt.
 -e .[dev]

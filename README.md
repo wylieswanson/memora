@@ -39,6 +39,7 @@ memora-motion/
   .work_pngs/            # parent for session temp dirs (--workdir); each render creates and removes a subdir
   memoramotion.py        # CLI implementation
   pyproject.toml         # package metadata and memoramotion console script
+  requirements-core.txt  # lightweight source-checkout dependencies
 ```
 
 ---
@@ -56,7 +57,7 @@ brew install ffmpeg
 ffmpeg -version
 ```
 
-Install Memora Motion from this repository:
+Install Memora Motion from this repository. The default install is the full runtime install and includes HEIC/HEIF, smart-focus, and YouTube upload dependencies:
 
 ```bash
 python -m pip install -U pip pipx
@@ -74,13 +75,30 @@ pip install -r requirements.txt
 memoramotion --help
 ```
 
-The Python installer includes the YouTube upload and smart-focus dependencies. `--smart-focus` uses MediaPipe Tasks. On first use, the app downloads the default Face Detector and Pose Landmarker model assets into `./.mediapipe_models`. Use the model override flags below if you want to pin or supply those assets manually.
+The default Python installer includes:
+- Pillow and `pillow-heif` for image input, including `.heic` and `.heif`
+- MediaPipe Tasks and NumPy for `--smart-focus`
+- Google API libraries for `--youtube-upload`
+
+For a lightweight source-checkout environment without MediaPipe or Google API dependencies, use:
+
+```bash
+python3 -m venv .venv-core
+source .venv-core/bin/activate
+python -m pip install -U pip
+pip install -r requirements-core.txt
+python memoramotion.py --help
+```
+
+That lightweight path supports normal photo/video rendering, including HEIC/HEIF via `pillow-heif`. Use the default install when you want `--smart-focus` or YouTube upload.
+
+`--smart-focus` uses MediaPipe Tasks. On first use, the app downloads the default Face Detector and Pose Landmarker model assets into `./.mediapipe_models`. Use the model override flags below if you want to pin or supply those assets manually.
 
 ---
 
 ## Usage
 
-Place photos into a folder such as input_photos. Supported extensions:
+Place photos into a folder such as input_photos. Supported image extensions:
 - .jpg .jpeg .png .webp .tif .tiff .heic .heif
 
 Run:
@@ -105,6 +123,10 @@ memoramotion ./input_photos
 | --sec | 2.8 | Base seconds per photo |
 | --xfade | 0.7 | Crossfade duration |
 | --transition | auto | Transition mode or explicit ffmpeg xfade transition |
+| --transition-sequence | off | Comma-separated transitions to cycle through, e.g. `fade,smoothleft,smoothright` |
+| --transition-random | off | Pick transitions randomly from the transition pool |
+| --transition-seed | --seed | Seed for `--transition-random` |
+| --transition-only | off | Comma-separated transition pool for auto/random modes |
 | --rhythm-strength | 0.12 | Pacing variation strength (0.0 to 0.25) |
 | --motion-style | auto | auto, none, kenburns, parallax, both |
 | --ken-burns-strength | auto | Override Ken Burns strength (0.0 to 0.03) |
@@ -121,6 +143,9 @@ memoramotion ./input_photos
 | --audio | none | Path to background audio file to mix into the slideshow |
 | --audio-offset | 0.0 | Skip N seconds into the background audio before mixing (e.g. skip to the drop) |
 | --audio-fade | off | Fade out the background audio over N seconds at the end |
+| --fit-to-audio | off | Adjust photo pacing so the video duration matches the background audio duration |
+| --audio-loop | off | Loop background audio when it is shorter than the rendered video |
+| --audio-trim-mode | hard | hard, fade, or loop |
 | --clip-max-sec | off | Trim video clips to at most N seconds |
 | --youtube-upload | off | Upload each rendered output to YouTube after rendering |
 | --youtube-upload-file | off | Upload an existing rendered `.mp4` to YouTube without re-rendering |
@@ -133,6 +158,9 @@ memoramotion ./input_photos
 | --youtube-category | 22 | YouTube category ID |
 | --youtube-privacy | private | private, public, unlisted |
 | --settings | on | Show resolved settings before rendering: `on` (human-readable block), `off` (suppress), `json` (machine-readable) |
+| --settings-only / --plan | off | Print resolved settings and planned output names without scanning or rendering |
+| --storyboard | off | Write a storyboard contact sheet showing media order, durations, and transitions |
+| --media-report | off | Write a JSON validation report for the input media |
 
 ## Output targets and quality
 
@@ -181,6 +209,12 @@ memoramotion ./input_photos --sec 3.5 --xfade 0.9
 # Stronger editorial pacing and auto transition rotation
 memoramotion ./input_photos --transition auto --rhythm-strength 0.18
 
+# Explicit transition cycle
+memoramotion ./input_photos --transition-sequence fade,smoothleft,smoothright
+
+# Random transitions from a restrained pool
+memoramotion ./input_photos --transition-random --transition-only fade,smoothleft --transition-seed 7
+
 # Vertical-only output
 memoramotion ./input_photos --format 9x16
 
@@ -217,11 +251,23 @@ memoramotion \
 # Render and import finished videos into macOS Photos
 memoramotion ./input_photos --add-to-photos
 
+# Fit photo pacing to a soundtrack and fade the audio at the end
+memoramotion ./input_photos --audio ./song.m4a --fit-to-audio --audio-trim-mode fade
+
+# Loop a short backing track until the video ends
+memoramotion ./input_photos --audio ./loop.wav --audio-loop
+
+# Generate preflight review artifacts
+memoramotion ./input_photos --storyboard --media-report --dry-run
+
 # Inspect resolved settings without rendering
 memoramotion ./input_photos --format both --resolution 4k --quality youtube --settings on --dry-run
 
-# Emit settings as JSON for scripting
-memoramotion ./input_photos --quality youtube --settings json | python3 -m json.tool
+# Print settings and planned output patterns without scanning the source folder
+memoramotion --plan --format both --resolution 4k --settings json
+
+# Emit plan/settings JSON for scripting
+memoramotion --plan --quality youtube --settings json | python3 -m json.tool
 
 # Suppress the settings block (e.g. in automated pipelines)
 memoramotion ./input_photos --settings off
@@ -269,6 +315,18 @@ Notes:
 
 ---
 
+## Workflow artifacts
+
+Each successful render writes a JSON manifest next to the `.mp4` as `<output>.mp4.json`. The manifest includes app version, resolved render config, output dimensions/duration, encoder used, source media order, per-item durations and start times, available EXIF/GPS/camera fields, and the FFmpeg command used for that output.
+
+`--storyboard` writes a JPEG contact sheet into the output folder before rendering. It is useful for checking ordering, item durations, and transition choices before waiting on a long render.
+
+`--media-report` writes a JSON validation report into the output folder. It summarizes processed photos/clips, unsupported files in the source folder, missing metadata, photos without GPS, video clips without audio, and very short media items.
+
+`--settings-only` and `--plan` do not scan the source folder or render anything. With `--settings json`, the output is a single JSON object containing `settings` and `planned_outputs`.
+
+---
+
 ## Visual style notes
 
 The compositor keeps full-photo visibility by layering:
@@ -283,6 +341,8 @@ Then each shot receives:
 
 Transitions:
 - auto mode rotates through a restrained set for a modern professional flow.
+- `--transition-sequence` cycles through an explicit comma-separated list.
+- `--transition-random` chooses from `--transition-only` when provided, otherwise from the curated auto set.
 
 Ken Burns motion:
 - `fit-overlay` is the default engine. It fits the foreground photo over the blurred background, animates an eased zoom, and gently biases the zoom anchor toward the smart-focus point.
@@ -309,9 +369,13 @@ Sort modes:
 
 ## Troubleshooting
 
-No supported images found:
-- verify you passed a photo folder, not a video-only folder
-- verify extensions are one of the supported image types
+No supported media found:
+- verify you passed a folder containing supported photos and/or video clips
+- verify image extensions are one of the supported image types
+
+HEIC/HEIF files fail to open:
+- install the default runtime dependencies with `python -m pip install .`
+- for lightweight source-checkout use, install `requirements-core.txt`
 
 ffmpeg not found:
 - install with Homebrew and confirm ffmpeg -version works in your shell

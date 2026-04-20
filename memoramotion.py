@@ -25,7 +25,6 @@ from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 APP_NAME = "Memora Motion"
@@ -44,7 +43,8 @@ def configure_mediapipe_runtime_env() -> None:
 
 configure_mediapipe_runtime_env()
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".heic", ".heif"}
+HEIF_EXTS = {".heic", ".heif"}
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"} | HEIF_EXTS
 VID_EXTS = {".mp4", ".mov"}
 
 QUALITY_PRESETS = {
@@ -134,6 +134,7 @@ VALID_TRANSITIONS = {
 }
 
 KEN_BURNS_ENGINE_CHOICES = ["fit-overlay", "preserve-stage", "fixed-viewport"]
+KEN_BURNS_ENGINE_ARG_CHOICES = ["auto", *KEN_BURNS_ENGINE_CHOICES]
 KEN_BURNS_ENGINE_ALIASES = {"fixed-frame": "preserve-stage"}
 KEN_BURNS_FOCUS_BIAS = 0.35
 KEN_BURNS_STAGE_MARGIN_MIN = 0.03
@@ -188,9 +189,15 @@ class RenderConfig:
     parallax_override: Optional[int] = None
     motion_seed: int = 0
     rhythm_strength: float = 0.12
+    transition_sequence: Optional[List[str]] = None
+    transition_random: bool = False
+    transition_seed: int = 0
+    transition_pool: Optional[List[str]] = None
     audio_path: Optional[Path] = None
     audio_offset: float = 0.0
     audio_fade: Optional[float] = None
+    audio_loop: bool = False
+    audio_trim_mode: str = "hard"
     clip_grade: str = "full"
     clip_audio: str = "mute"
     clip_max_sec: Optional[float] = None
@@ -259,6 +266,7 @@ _MEDIAPIPE_FACE_DETECTOR: Optional[Any] = None
 _MEDIAPIPE_POSE_DETECTOR: Optional[Any] = None
 _MEDIAPIPE_FACE_MODEL_PATH: Optional[Path] = None
 _MEDIAPIPE_POSE_MODEL_PATH: Optional[Path] = None
+_HEIF_OPENER_REGISTERED = False
 
 SMART_FOCUS_FACE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_detector/"
@@ -298,14 +306,16 @@ def resolve_motion_style(motion_style: str, smart_focus: bool) -> str:
 
 def normalize_ken_burns_engine(engine: str) -> str:
     normalized = KEN_BURNS_ENGINE_ALIASES.get(engine.strip().lower(), engine.strip().lower())
+    if normalized == "auto":
+        return normalized
     if normalized not in KEN_BURNS_ENGINE_CHOICES:
-        supported = ", ".join(KEN_BURNS_ENGINE_CHOICES)
+        supported = ", ".join(KEN_BURNS_ENGINE_ARG_CHOICES)
         raise argparse.ArgumentTypeError(f"must be one of: {supported}")
     return normalized
 
 
 def resolve_ken_burns_engine(engine: Optional[str], smart_focus: bool, motion_style: str) -> str:
-    if engine is None:
+    if engine is None or engine == "auto":
         if smart_focus and motion_style in ("kenburns", "both"):
             return "fixed-viewport"
         return "fit-overlay"
@@ -459,9 +469,29 @@ def _get_mediapipe_task_modules() -> Tuple[Any, Any, Any]:
     except ImportError as exc:
         raise SystemExit(
             f"{APP_NAME} was installed without MediaPipe Tasks. "
-            "Reinstall with dependencies: python -m pip install ."
+            "Install the default runtime dependencies with: python -m pip install ."
         ) from exc
     return mp, mp_python, vision
+
+
+def ensure_heif_support() -> None:
+    """Register Pillow's HEIF/HEIC opener before reading those image formats."""
+    global _HEIF_OPENER_REGISTERED
+
+    if _HEIF_OPENER_REGISTERED:
+        return
+
+    try:
+        pillow_heif = importlib.import_module("pillow_heif")
+        register_heif_opener = getattr(pillow_heif, "register_heif_opener")
+    except (ImportError, AttributeError) as exc:
+        raise SystemExit(
+            "HEIC/HEIF input requires pillow-heif. "
+            "Install the default runtime dependencies with: python -m pip install ."
+        ) from exc
+
+    register_heif_opener()
+    _HEIF_OPENER_REGISTERED = True
 
 
 def _get_mediapipe_detectors() -> Tuple[Any, Any]:
@@ -507,6 +537,7 @@ def _get_mediapipe_detectors() -> Tuple[Any, Any]:
 
 
 def _pil_to_mediapipe_image(image: Image.Image) -> Any:
+    np = importlib.import_module("numpy")
     mp, _mp_python, _vision = _get_mediapipe_task_modules()
     image_rgb = np.asarray(image.convert("RGB"))
     return mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
@@ -683,6 +714,22 @@ def probe_video_clip(path: Path) -> Optional["PhotoInfo"]:
     )
 
 
+def probe_audio_duration(path: Path) -> Optional[float]:
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        raw_duration = data.get("format", {}).get("duration")
+        return float(raw_duration) if raw_duration else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def estimate_duration_variable(photo_durations: List[float], xfade_seconds: float) -> float:
     if not photo_durations:
         return 0.0
@@ -802,11 +849,88 @@ def build_media_durations(
     return result
 
 
+def resolve_fit_to_audio_sec(
+    infos: List[Optional["PhotoInfo"]],
+    base_sec: float,
+    xfade: float,
+    rhythm_strength: float,
+    seed: int,
+    clip_max_sec: Optional[float],
+    target_duration: float,
+) -> Optional[float]:
+    if target_duration <= 0 or not any(not (info and info.is_video) for info in infos):
+        return None
+
+    def duration_for(sec: float) -> float:
+        return estimate_duration_variable(
+            build_media_durations(infos, sec, xfade, rhythm_strength, seed, clip_max_sec),
+            xfade,
+        )
+
+    min_sec = max(xfade + 0.25, 0.6)
+    min_duration = duration_for(min_sec)
+    if target_duration <= min_duration:
+        return min_sec
+
+    lo = min_sec
+    hi = max(base_sec, min_sec)
+    while duration_for(hi) < target_duration and hi < 120:
+        hi *= 1.5
+    if duration_for(hi) < target_duration:
+        return hi
+
+    for _ in range(24):
+        mid = (lo + hi) / 2.0
+        if duration_for(mid) < target_duration:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
 def resolve_transition_name(transition_mode: str, index: int) -> str:
     """Resolve transition name for a segment index (1-based image index)."""
     if transition_mode == "auto":
         return PRO_TRANSITIONS[(index - 1) % len(PRO_TRANSITIONS)]
     return transition_mode
+
+
+def parse_transition_list(raw: Optional[str], label: str) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    values = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError(f"{label} must include at least one transition")
+    transitions = [validate_transition(value) for value in values]
+    if "auto" in transitions:
+        raise argparse.ArgumentTypeError(f"{label} cannot include auto")
+    return transitions
+
+
+def transition_label_for_output(args) -> str:
+    if getattr(args, "transition_sequence", None):
+        return "sequence"
+    if getattr(args, "transition_random", False):
+        return "random"
+    return args.transition
+
+
+def _resolved_transition_for_index(
+    transition_mode: str,
+    index: int,
+    transition_sequence: Optional[List[str]] = None,
+    transition_random: bool = False,
+    transition_seed: int = 0,
+    transition_pool: Optional[List[str]] = None,
+) -> str:
+    if transition_sequence:
+        return transition_sequence[(index - 1) % len(transition_sequence)]
+    if transition_random:
+        pool = transition_pool or PRO_TRANSITIONS
+        return random.Random(transition_seed + index * 1009).choice(pool)
+    if transition_mode == "auto" and transition_pool:
+        return transition_pool[(index - 1) % len(transition_pool)]
+    return resolve_transition_name(transition_mode, index)
 
 
 def _rational_to_float(val) -> float:
@@ -941,6 +1065,8 @@ def get_image_metadata(img_path: Path, image: Image.Image, extract_exif: bool, d
 def _convert_single_image(args_tuple):
     src, idx, work_dir, extract_exif, detect_focus = args_tuple
     try:
+        if src.suffix.lower() in HEIF_EXTS:
+            ensure_heif_support()
         with Image.open(src) as opened:
             im = ImageOps.exif_transpose(opened)
             info = get_image_metadata(src, im, extract_exif, detect_focus)
@@ -985,6 +1111,9 @@ def convert_to_pngs(
     image_files = [p for p in files if p.suffix.lower() in IMG_EXTS]
     if not image_files:
         return [], [], {}
+    if any(p.suffix.lower() in HEIF_EXTS for p in image_files):
+        progress_print(show_progress, "[phase prep] enabling HEIC/HEIF support")
+        ensure_heif_support()
 
     args_list = [(p, i, work_dir, extract_exif, detect_focus) for i, p in enumerate(image_files)]
     progress_every = 1 if len(image_files) <= 10 else 5
@@ -1384,6 +1513,10 @@ def build_xfade_chain(
     xfade: float,
     transition: str = "auto",
     stream_names: Optional[List[str]] = None,
+    transition_sequence: Optional[List[str]] = None,
+    transition_random: bool = False,
+    transition_seed: int = 0,
+    transition_pool: Optional[List[str]] = None,
 ):
     n = len(photo_durations)
     names = stream_names if stream_names is not None else [f"[v{i}]" for i in range(n)]
@@ -1394,7 +1527,14 @@ def build_xfade_chain(
     cur = names[0]
     for i in range(1, n):
         out = f"[x{i}]"
-        resolved_transition = resolve_transition_name(transition, i)
+        resolved_transition = _resolved_transition_for_index(
+            transition,
+            i,
+            transition_sequence=transition_sequence,
+            transition_random=transition_random,
+            transition_seed=transition_seed,
+            transition_pool=transition_pool,
+        )
         parts.append(
             f"{cur}{names[i]}xfade=transition={resolved_transition}:duration={xfade}:offset={starts[i]}{out}"
         )
@@ -1509,6 +1649,20 @@ def run_ffmpeg_with_progress(cmd: List[str], total_duration: float):
         raise RuntimeError(f"ffmpeg render failed with exit code {ret}.\n{tail}")
 
 
+def _effective_audio_fade(cfg: RenderConfig, duration: float) -> Optional[float]:
+    if duration <= 0:
+        return None
+    if cfg.audio_trim_mode == "fade":
+        return min(cfg.audio_fade if cfg.audio_fade is not None else 2.0, duration)
+    if cfg.audio_fade and cfg.audio_fade > 0:
+        return min(cfg.audio_fade, duration)
+    return None
+
+
+def _actual_encoder_label(actual_encoder: Any, fallback: str) -> str:
+    return actual_encoder if isinstance(actual_encoder, str) and actual_encoder else fallback
+
+
 def build_render_command(
     images: List[Path],
     out_path: Path,
@@ -1536,6 +1690,8 @@ def build_render_command(
             cmd += ["-loop", "1", "-t", str(item_dur), "-i", str(img)]
 
     if cfg.audio_path is not None:
+        if cfg.audio_loop or cfg.audio_trim_mode == "loop":
+            cmd += ["-stream_loop", "-1"]
         if cfg.audio_offset > 0:
             cmd += ["-ss", str(cfg.audio_offset)]
         cmd += ["-i", str(cfg.audio_path)]
@@ -1582,7 +1738,16 @@ def build_render_command(
     filter_parts = [";\n".join(filters)]
     if overlay_filters:
         filter_parts.append(";\n".join(overlay_filters))
-    filter_parts.append(build_xfade_chain(media_durations, cfg.xfade, cfg.transition, stream_names))
+    filter_parts.append(build_xfade_chain(
+        media_durations,
+        cfg.xfade,
+        cfg.transition,
+        stream_names,
+        transition_sequence=cfg.transition_sequence,
+        transition_random=cfg.transition_random,
+        transition_seed=cfg.transition_seed,
+        transition_pool=cfg.transition_pool,
+    ))
 
     # Audio: use filter-complex mixing when clips have audible audio (keep/duck);
     # otherwise fall back to the simple -map + -af apad approach.
@@ -1592,7 +1757,7 @@ def build_render_command(
     if use_complex_audio:
         audio_filter = _build_clip_audio_filters(
             infos_list, media_durations, cfg.xfade, audio_input_idx, cfg.clip_audio,
-            audio_fade=cfg.audio_fade, total_duration=duration,
+            audio_fade=_effective_audio_fade(cfg, duration), total_duration=duration,
         )
         if audio_filter:
             filter_parts.append(audio_filter)
@@ -1604,8 +1769,8 @@ def build_render_command(
         cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-shortest"]
     elif cfg.audio_path is not None:
         af = "apad"
-        if cfg.audio_fade and cfg.audio_fade > 0 and duration > 0:
-            effective_fade = min(cfg.audio_fade, duration)
+        effective_fade = _effective_audio_fade(cfg, duration)
+        if effective_fade:
             fade_st = duration - effective_fade
             af += f",afade=t=out:st={fade_st:.3f}:d={effective_fade:.3f}"
         cmd += ["-map", f"{audio_input_idx}:a", "-af", af, "-c:a", "aac", "-b:a", "192k", "-shortest"]
@@ -1778,7 +1943,7 @@ def parse_args():
                     help="Motion style: auto, none, kenburns, parallax, or both")
     ap.add_argument("--ken-burns-strength", type=float, default=None)
     ap.add_argument("--ken-burns-engine", default=None, type=normalize_ken_burns_engine,
-                    choices=KEN_BURNS_ENGINE_CHOICES,
+                    choices=KEN_BURNS_ENGINE_ARG_CHOICES,
                     help="Ken Burns renderer: auto, fit-overlay, preserve-stage, or fixed-viewport")
     ap.add_argument("--parallax-px", type=int, default=None)
     ap.add_argument("--smart-focus", action="store_true",
@@ -1794,6 +1959,14 @@ def parse_args():
     ap.add_argument("--sec", type=float, default=2.8)
     ap.add_argument("--xfade", type=float, default=0.7)
     ap.add_argument("--transition", default="auto", type=validate_transition)
+    ap.add_argument("--transition-sequence", default=None,
+                    help="Comma-separated transitions to cycle through, e.g. fade,smoothleft,smoothright")
+    ap.add_argument("--transition-random", action="store_true",
+                    help="Choose transitions randomly from the transition pool using --transition-seed")
+    ap.add_argument("--transition-seed", type=int, default=None,
+                    help="Seed for --transition-random (defaults to --seed)")
+    ap.add_argument("--transition-only", default=None,
+                    help="Comma-separated transition pool for auto/random modes")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--rhythm-strength", type=float, default=0.12,
                     help="Per-photo timing variation strength (0.0 to 0.25)")
@@ -1803,6 +1976,12 @@ def parse_args():
                     help="Start the background audio at this offset in seconds (e.g. skip to the drop)")
     ap.add_argument("--audio-fade", type=float, default=None,
                     help="Fade out the background audio over this many seconds at the end of the video")
+    ap.add_argument("--fit-to-audio", action="store_true",
+                    help="Adjust photo pacing so the video duration matches the background audio duration")
+    ap.add_argument("--audio-loop", action="store_true",
+                    help="Loop background audio when it is shorter than the rendered video")
+    ap.add_argument("--audio-trim-mode", default="hard", choices=["hard", "fade", "loop"],
+                    help="How to end background audio: hard cut, fade, or loop until video end")
     ap.add_argument("--clip-max-sec", type=float, default=None,
                     help="Maximum duration in seconds for video clips (longer clips are trimmed to this length)")
     ap.add_argument("--clip-grade", default="full", choices=["none", "grade", "full"],
@@ -1817,6 +1996,14 @@ def parse_args():
                     help="Override output bitrate, e.g. 20M (overrides quality preset)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print ffmpeg command(s) and estimated duration without rendering")
+    ap.add_argument("--settings-only", action="store_true",
+                    help="Print resolved settings and planned outputs without scanning or rendering")
+    ap.add_argument("--plan", action="store_true",
+                    help="Alias for --settings-only")
+    ap.add_argument("--storyboard", action="store_true",
+                    help="Write a storyboard contact sheet showing media order, durations, and transitions")
+    ap.add_argument("--media-report", action="store_true",
+                    help="Write a JSON validation report for the input media")
     ap.add_argument("--youtube-upload", action="store_true",
                     help="Upload rendered videos to YouTube after rendering completes")
     ap.add_argument("--youtube-upload-file", default=None,
@@ -2115,7 +2302,7 @@ def _load_youtube_credentials(token_file: Path, client_secrets: Path):
     except ImportError as exc:
         raise SystemExit(
             f"{APP_NAME} was installed without the Google API libraries required for YouTube upload. "
-            "Reinstall with dependencies: python -m pip install ."
+            "Install the default runtime dependencies with: python -m pip install ."
         ) from exc
 
     scopes = ["https://www.googleapis.com/auth/youtube.upload"]
@@ -2156,7 +2343,7 @@ def upload_video_to_youtube(
     except ImportError as exc:
         raise SystemExit(
             f"{APP_NAME} was installed without the Google API libraries required for YouTube upload. "
-            "Reinstall with dependencies: python -m pip install ."
+            "Install the default runtime dependencies with: python -m pip install ."
         ) from exc
 
     creds = _load_youtube_credentials(token_file=token_file, client_secrets=client_secrets)
@@ -2225,6 +2412,108 @@ def build_label_overlay_paths_for_infos(
     return result
 
 
+def create_storyboard_contact_sheet(
+    images: List[Path],
+    infos: List[Optional[PhotoInfo]],
+    durations: List[float],
+    transition_names: List[str],
+    output_path: Path,
+    columns: int = 5,
+) -> None:
+    tile_w, tile_h = 360, 270
+    thumb_h = 190
+    rows = max(1, math.ceil(len(images) / columns))
+    sheet = Image.new("RGB", (columns * tile_w, rows * tile_h), color=(245, 245, 242))
+    draw = ImageDraw.Draw(sheet)
+
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16, index=0)
+        small_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 13, index=0)
+    except Exception:
+        font = ImageFont.load_default()
+        small_font = ImageFont.load_default()
+
+    for i, (path, info, duration) in enumerate(zip(images, infos, durations)):
+        x = (i % columns) * tile_w
+        y = (i // columns) * tile_h
+        draw.rectangle([x, y, x + tile_w - 1, y + tile_h - 1], outline=(210, 210, 205))
+        if info and info.is_video:
+            draw.rectangle([x + 12, y + 12, x + tile_w - 12, y + thumb_h], fill=(48, 52, 58))
+            draw.text((x + 24, y + 82), "VIDEO CLIP", font=font, fill=(255, 255, 255))
+        else:
+            try:
+                with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img).convert("RGB")
+                    img.thumbnail((tile_w - 24, thumb_h - 24))
+                    px = x + (tile_w - img.width) // 2
+                    py = y + 12 + (thumb_h - 24 - img.height) // 2
+                    sheet.paste(img, (px, py))
+            except Exception:
+                draw.rectangle([x + 12, y + 12, x + tile_w - 12, y + thumb_h], fill=(80, 80, 80))
+                draw.text((x + 24, y + 82), "IMAGE", font=font, fill=(255, 255, 255))
+
+        source_name = (info.path.name if info else path.name)
+        text_y = y + thumb_h + 6
+        draw.text((x + 12, text_y), f"{i + 1:02d}. {source_name[:34]}", font=small_font, fill=(30, 30, 30))
+        draw.text((x + 12, text_y + 20), f"{duration:.1f}s", font=small_font, fill=(70, 70, 70))
+        if i > 0 and i - 1 < len(transition_names):
+            draw.text((x + 90, text_y + 20), f"tx: {transition_names[i - 1]}", font=small_font, fill=(70, 70, 70))
+        if info and info.location_name:
+            draw.text((x + 12, text_y + 40), info.location_name[:42], font=small_font, fill=(70, 70, 70))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path, "JPEG", quality=88)
+
+
+def build_media_validation_report(
+    src: Path,
+    images: List[Path],
+    infos: List[Optional[PhotoInfo]],
+    durations: List[float],
+) -> dict:
+    files = sorted(src.iterdir(), key=lambda p: natural_key(p.name))
+    supported_exts = IMG_EXTS | VID_EXTS
+    unsupported = [p.name for p in files if p.is_file() and p.suffix.lower() not in supported_exts]
+    missing_info = [images[i].name for i, info in enumerate(infos) if info is None]
+    missing_datetime = [info.path.name for info in infos if info and not info.datetime_taken]
+    missing_gps = [info.path.name for info in infos if info and not info.is_video and not info.gps_coords]
+    video_without_audio = [info.path.name for info in infos if info and info.is_video and not info.has_audio]
+    very_short = [
+        {"filename": info.path.name if info else images[i].name, "duration_sec": durations[i]}
+        for i, info in enumerate(infos)
+        if i < len(durations) and durations[i] < 1.0
+    ]
+    return {
+        "schema_version": 1,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source_dir": str(src),
+        "counts": {
+            "processed_items": len(images),
+            "photos": sum(1 for info in infos if not (info and info.is_video)),
+            "clips": sum(1 for info in infos if info and info.is_video),
+            "unsupported_files": len(unsupported),
+            "missing_metadata": len(missing_info),
+        },
+        "unsupported_files": unsupported,
+        "missing_metadata": missing_info,
+        "missing_datetime": missing_datetime,
+        "photos_without_gps": missing_gps,
+        "video_clips_without_audio": video_without_audio,
+        "very_short_items": very_short,
+    }
+
+
+def write_media_validation_report(report: dict, path: Path) -> None:
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    counts = report["counts"]
+    print(
+        "Media report: "
+        f"{counts['processed_items']} processed, "
+        f"{counts['unsupported_files']} unsupported, "
+        f"{counts['missing_metadata']} missing metadata -> {path}"
+    )
+
+
 def build_effective_settings(args, fps: int, resolution: str, bitrate: str, encoder: str) -> dict:
     target_dims: dict = {}
     if args.format in ("16x9", "both"):
@@ -2256,10 +2545,15 @@ def build_effective_settings(args, fps: int, resolution: str, bitrate: str, enco
         "sec": args.sec,
         "xfade": args.xfade,
         "transition": args.transition,
+        "transition_sequence": getattr(args, "transition_sequence", None),
+        "transition_random": getattr(args, "transition_random", False),
+        "transition_seed": getattr(args, "transition_seed", None),
+        "transition_pool": getattr(args, "transition_only", None),
         "rhythm_strength": args.rhythm_strength,
         "sort_by": args.sort_by,
         "seed": args.seed,
         "split_secs": args.split_secs,
+        "settings_only": getattr(args, "settings_only", False) or getattr(args, "plan", False),
         "motion_style": args.motion_style,
         "ken_burns_engine": args.ken_burns_engine,
         "ken_burns_strength": ken,
@@ -2278,6 +2572,11 @@ def build_effective_settings(args, fps: int, resolution: str, bitrate: str, enco
         "audio": str(Path(args.audio)) if args.audio else None,
         "audio_offset": args.audio_offset,
         "audio_fade": args.audio_fade,
+        "audio_loop": getattr(args, "audio_loop", False),
+        "audio_trim_mode": getattr(args, "audio_trim_mode", "hard"),
+        "fit_to_audio": getattr(args, "fit_to_audio", False),
+        "storyboard": getattr(args, "storyboard", False),
+        "media_report": getattr(args, "media_report", False),
         "youtube_upload": args.youtube_upload,
         "youtube_upload_file": str(args.youtube_upload_file) if args.youtube_upload_file else None,
         "youtube_privacy": args.youtube_privacy,
@@ -2320,6 +2619,12 @@ def print_effective_settings(settings: dict, mode: str) -> None:
     audio_line = f"  audio:    {settings['audio'] or '(none)'}  offset={settings['audio_offset']}s"
     if settings["audio_fade"] is not None:
         audio_line += f"  fade={settings['audio_fade']}s"
+    if settings.get("audio_loop"):
+        audio_line += "  loop=True"
+    if settings.get("audio_trim_mode") != "hard":
+        audio_line += f"  trim={settings['audio_trim_mode']}"
+    if settings.get("fit_to_audio"):
+        audio_line += "  fit=True"
     lines.append(audio_line)
     actions = []
     if settings["youtube_upload"]:
@@ -2329,13 +2634,171 @@ def print_effective_settings(settings: dict, mode: str) -> None:
     if settings["add_to_photos"]:
         actions.append("add-to-photos")
     extras = [
-        k for k in ("camera_stats", "geocode", "location_stats", "location_overlay")
+        k for k in ("camera_stats", "geocode", "location_stats", "location_overlay", "storyboard", "media_report", "settings_only")
         if settings.get(k)
     ]
     lines.append(f"  actions:  {', '.join(actions) if actions else '(none)'}")
     if extras:
         lines.append(f"  extras:   {', '.join(extras)}")
     print("\n".join(lines))
+
+
+def _path_stat_dict(path: Path) -> dict:
+    try:
+        st = path.stat()
+    except OSError:
+        return {"exists": False}
+    mtime = getattr(st, "st_mtime", None)
+    return {
+        "exists": True,
+        "size_bytes": getattr(st, "st_size", None),
+        "mtime": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mtime)) if mtime is not None else None,
+    }
+
+
+def _info_datetime(info: Optional[PhotoInfo]) -> Optional[str]:
+    return info.datetime_taken.isoformat() if info and info.datetime_taken else None
+
+
+def build_media_entries(
+    images: List[Path],
+    infos: List[Optional[PhotoInfo]],
+    durations: List[float],
+    xfade: float,
+    focal_points: Optional[List[Optional[Tuple[float, float]]]] = None,
+) -> List[dict]:
+    starts = _media_start_times(durations, xfade)
+    entries = []
+    for i, (render_input, info, duration) in enumerate(zip(images, infos, durations)):
+        source_path = info.path if info else render_input
+        entries.append({
+            "index": i,
+            "type": "video" if info and info.is_video else "photo",
+            "source_path": str(source_path),
+            "render_input_path": str(render_input),
+            "source_stat": _path_stat_dict(source_path),
+            "duration_sec": round(duration, 6),
+            "start_sec": round(starts[i], 6) if i < len(starts) else 0.0,
+            "width": info.width if info else None,
+            "height": info.height if info else None,
+            "datetime_taken": _info_datetime(info),
+            "gps_coords": list(info.gps_coords) if info and info.gps_coords else None,
+            "camera": " ".join(part for part in ((info.camera_make if info else ""), (info.camera_model if info else "")) if part).strip() or None,
+            "location_name": info.location_name if info else None,
+            "has_audio": bool(info.has_audio) if info and info.is_video else None,
+            "focal_point": list(focal_points[i]) if focal_points and i < len(focal_points) and focal_points[i] else None,
+        })
+    return entries
+
+
+def _render_config_dict(cfg: RenderConfig) -> dict:
+    return {
+        "fps": cfg.fps,
+        "sec": cfg.sec,
+        "xfade": cfg.xfade,
+        "transition": cfg.transition,
+        "transition_sequence": cfg.transition_sequence,
+        "transition_random": cfg.transition_random,
+        "transition_seed": cfg.transition_seed,
+        "transition_pool": cfg.transition_pool,
+        "blur_strength": cfg.blur_strength,
+        "bitrate": cfg.bitrate,
+        "quality": cfg.quality_name,
+        "encoder_requested": cfg.encoder,
+        "motion_style": cfg.motion_style,
+        "ken_burns_engine": cfg.ken_burns_engine,
+        "ken_burns_strength": cfg.ken_override,
+        "parallax_px": cfg.parallax_override,
+        "motion_seed": cfg.motion_seed,
+        "rhythm_strength": cfg.rhythm_strength,
+        "audio_path": str(cfg.audio_path) if cfg.audio_path else None,
+        "audio_offset": cfg.audio_offset,
+        "audio_fade": cfg.audio_fade,
+        "audio_loop": cfg.audio_loop,
+        "audio_trim_mode": cfg.audio_trim_mode,
+        "clip_grade": cfg.clip_grade,
+        "clip_audio": cfg.clip_audio,
+        "clip_max_sec": cfg.clip_max_sec,
+    }
+
+
+def write_render_manifest(
+    out: Path,
+    src: Path,
+    width: int,
+    height: int,
+    cfg: RenderConfig,
+    actual_encoder: str,
+    images: List[Path],
+    infos: List[Optional[PhotoInfo]],
+    focal_points: Optional[List[Optional[Tuple[float, float]]]],
+    render_command: List[str],
+    duration: float,
+    part_index: Optional[int] = None,
+) -> Path:
+    durations = build_media_durations(infos, cfg.sec, cfg.xfade, cfg.rhythm_strength, cfg.motion_seed, cfg.clip_max_sec)
+    manifest = {
+        "schema_version": 1,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "app": {"name": APP_NAME, "version": APP_VERSION},
+        "source_dir": str(src),
+        "output": {
+            "path": str(out),
+            "filename": out.name,
+            "width": width,
+            "height": height,
+            "duration_sec": round(duration, 6),
+            "encoder": actual_encoder,
+            "part_index": part_index,
+            "stat": _path_stat_dict(out),
+        },
+        "counts": {
+            "items": len(images),
+            "photos": sum(1 for info in infos if not (info and info.is_video)),
+            "clips": sum(1 for info in infos if info and info.is_video),
+        },
+        "config": _render_config_dict(cfg),
+        "media": build_media_entries(images, infos, durations, cfg.xfade, focal_points),
+        "ffmpeg_command": render_command,
+    }
+    manifest_path = out.with_suffix(out.suffix + ".json")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest_path
+
+
+def build_settings_only_plan(args, resolution: str) -> List[dict]:
+    stamp = "<timestamp>"
+    input_name = Path(args.source_dir).name if args.source_dir else "<source-folder>"
+    targets = build_targets(
+        args.format,
+        stamp,
+        input_name,
+        args.quality,
+        transition_label_for_output(args),
+        photo_count=0,
+        clip_count=0,
+        resolution=resolution,
+    )
+    return [
+        {
+            "format": "16x9" if "fmt16x9" in name else "9x16",
+            "width": width,
+            "height": height,
+            "filename_pattern": name.replace("_n0.mp4", "_n<photos>[c<clips>].mp4"),
+        }
+        for name, width, height in targets
+    ]
+
+
+def print_settings_only_plan(settings: dict, planned_outputs: List[dict], mode: str) -> None:
+    if mode == "json":
+        print(json.dumps({"settings": settings, "planned_outputs": planned_outputs}, indent=2))
+        return
+    print_effective_settings(settings, mode)
+    if mode != "off":
+        print("\nPlanned outputs")
+        for item in planned_outputs:
+            print(f"- {item['format']} {item['width']}x{item['height']}: {item['filename_pattern']}")
 
 
 def _validate_args(args) -> None:
@@ -2375,6 +2838,15 @@ def _validate_args(args) -> None:
         raise SystemExit(f"--smart-focus-pose-model file not found: {args.smart_focus_pose_model}")
     if not (0.0 <= args.rhythm_strength <= 0.25):
         raise SystemExit("--rhythm-strength must be between 0.0 and 0.25")
+    try:
+        args.transition_sequence = parse_transition_list(getattr(args, "transition_sequence", None), "--transition-sequence")
+        args.transition_only = parse_transition_list(getattr(args, "transition_only", None), "--transition-only")
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(str(exc)) from exc
+    if getattr(args, "transition_random", False) and args.transition_sequence:
+        raise SystemExit("--transition-random cannot be combined with --transition-sequence")
+    if getattr(args, "transition_seed", None) is None:
+        args.transition_seed = args.seed
     if should_upload and not args.youtube_category.isdigit():
         raise SystemExit("--youtube-category must be a numeric YouTube category ID")
     if args.split_secs is not None and args.split_secs <= 0:
@@ -2387,6 +2859,10 @@ def _validate_args(args) -> None:
         raise SystemExit("--audio-offset must be >= 0")
     if args.audio_fade is not None and args.audio_fade <= 0:
         raise SystemExit("--audio-fade must be > 0")
+    if args.fit_to_audio and not args.audio:
+        raise SystemExit("--fit-to-audio requires --audio")
+    if args.audio_loop:
+        args.audio_trim_mode = "loop"
     if args.clip_max_sec is not None and args.clip_max_sec <= 0:
         raise SystemExit("--clip-max-sec must be > 0")
     if args.fps is not None and args.fps < 12:
@@ -2476,6 +2952,7 @@ def _phase_prep(
     args,
     src: Path,
     temp_work: Path,
+    outdir: Path,
     blur: int,
     fps: int,
     resolution: str,
@@ -2532,18 +3009,58 @@ def _phase_prep(
         focused_count = sum(1 for point in focal_points if point is not None)
         print(f"Smart focus: detected subjects in {focused_count}/{len(focal_points) - n_clips} photos")
 
-    estimated_total = estimate_duration_variable(
-        build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec),
-        args.xfade,
-    )
+    if args.fit_to_audio and audio_path is not None:
+        audio_duration = probe_audio_duration(audio_path)
+        if audio_duration is None:
+            print(f"Warning: could not read audio duration for --fit-to-audio: {audio_path}", file=sys.stderr)
+        else:
+            target_duration = max(0.0, audio_duration - args.audio_offset)
+            fitted_sec = resolve_fit_to_audio_sec(
+                infos,
+                args.sec,
+                args.xfade,
+                args.rhythm_strength,
+                args.seed,
+                args.clip_max_sec,
+                target_duration,
+            )
+            if fitted_sec is None:
+                print("Warning: --fit-to-audio has no photo items to adjust", file=sys.stderr)
+            else:
+                old_sec = args.sec
+                args.sec = fitted_sec
+                print(f"Audio fit: adjusted --sec from {old_sec:.3f}s to {args.sec:.3f}s for {target_duration:.1f}s target")
+
+    media_durations = build_media_durations(infos, args.sec, args.xfade, args.rhythm_strength, args.seed, args.clip_max_sec)
+    estimated_total = estimate_duration_variable(media_durations, args.xfade)
     n_photos = len(images) - n_clips
     print(f"Media: {n_photos} photos, {n_clips} clips → estimated {estimated_total:.1f}s total")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     targets = build_targets(
-        args.format, stamp, src.name, args.quality, args.transition,
+        args.format, stamp, src.name, args.quality, transition_label_for_output(args),
         n_photos, n_clips, resolution=resolution,
     )
+
+    transition_names = [
+        _resolved_transition_for_index(
+            args.transition,
+            i,
+            transition_sequence=args.transition_sequence,
+            transition_random=args.transition_random,
+            transition_seed=args.transition_seed,
+            transition_pool=args.transition_only,
+        )
+        for i in range(1, len(images))
+    ]
+    if args.storyboard:
+        storyboard_path = outdir / f"{stamp}_{_slug(src.name)}_storyboard.jpg"
+        create_storyboard_contact_sheet(images, infos, media_durations, transition_names, storyboard_path)
+        print(f"Storyboard: {storyboard_path}")
+    if args.media_report:
+        report = build_media_validation_report(src, images, infos, media_durations)
+        report_path = outdir / f"{stamp}_{_slug(src.name)}_media-report.json"
+        write_media_validation_report(report, report_path)
 
     if args.split_secs is not None:
         part_groups = split_photos_into_parts(
@@ -2568,12 +3085,17 @@ def _phase_prep(
 
     base_cfg = RenderConfig(
         fps=fps, sec=args.sec, xfade=args.xfade, transition=args.transition,
+        transition_sequence=args.transition_sequence,
+        transition_random=args.transition_random,
+        transition_seed=args.transition_seed,
+        transition_pool=args.transition_only,
         blur_strength=blur, bitrate=bitrate, quality_name=args.quality,
         encoder=encoder, motion_style=args.motion_style,
         ken_burns_engine=args.ken_burns_engine,
         ken_override=args.ken_burns_strength, parallax_override=args.parallax_px,
         motion_seed=args.seed, rhythm_strength=args.rhythm_strength,
         audio_path=audio_path, audio_offset=args.audio_offset, audio_fade=args.audio_fade,
+        audio_loop=args.audio_loop, audio_trim_mode=args.audio_trim_mode,
         clip_grade=args.clip_grade, clip_audio=args.clip_audio, clip_max_sec=args.clip_max_sec,
     )
     return images, infos, focal_points, n_clips, targets, part_groups, part_audio_offsets, base_cfg
@@ -2617,9 +3139,20 @@ def _phase_render(
                 images, out, width, height, base_cfg,
                 focal_points=focal_points, label_overlay_paths=label_overlay_paths, infos=infos,
             )
+            actual_encoder = _actual_encoder_label(actual_encoder, base_cfg.encoder)
             outputs.append(out)
+            manifest_cfg = dataclass_replace(base_cfg, encoder=actual_encoder)
+            manifest_cmd, manifest_duration = build_render_command(
+                images, out, width, height, manifest_cfg,
+                focal_points=focal_points, label_overlay_paths=label_overlay_paths, infos=infos,
+            )
+            manifest_path = write_render_manifest(
+                out, src, width, height, manifest_cfg, actual_encoder,
+                images, infos, focal_points, manifest_cmd, manifest_duration,
+            )
             note = f" (used {actual_encoder})" if actual_encoder != encoder else ""
             progress_print(args.progress, f"[phase render] completed {out.name}{note}")
+            progress_print(args.progress, f"[phase manifest] wrote {manifest_path.name}")
             _post_render_output(out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
 
         if part_groups:
@@ -2640,12 +3173,24 @@ def _phase_render(
                     print(f"[dry-run] part {part_idx} {width}x{height} estimated_duration={duration:.1f}s")
                     print(f"[dry-run] {' '.join(cmd)}")
                 else:
-                    render(
+                    part_encoder = render(
                         part_imgs, part_out, width, height, part_cfg,
                         focal_points=part_focal, label_overlay_paths=part_label_paths, infos=part_infos,
                     )
+                    part_encoder = _actual_encoder_label(part_encoder, part_cfg.encoder)
                     outputs.append(part_out)
+                    part_manifest_cfg = dataclass_replace(part_cfg, encoder=part_encoder)
+                    part_cmd, part_duration = build_render_command(
+                        part_imgs, part_out, width, height, part_manifest_cfg,
+                        focal_points=part_focal, label_overlay_paths=part_label_paths, infos=part_infos,
+                    )
+                    part_manifest_path = write_render_manifest(
+                        part_out, src, width, height, part_manifest_cfg, part_encoder,
+                        part_imgs, part_infos, part_focal, part_cmd, part_duration,
+                        part_index=part_idx,
+                    )
                     progress_print(args.progress, f"[phase split] completed {part_out.name}")
+                    progress_print(args.progress, f"[phase manifest] wrote {part_manifest_path.name}")
                     _post_render_output(part_out, src, width, height, args, youtube_client_secrets, youtube_token_file, youtube_tags)
     return outputs
 
@@ -2658,7 +3203,6 @@ def main():
     upload_only_path = Path(args.youtube_upload_file) if args.youtube_upload_file else None
     audio_path = Path(args.audio) if args.audio else None
     outdir = Path(args.outdir)
-    ensure_dir(outdir)
 
     preset = QUALITY_PRESETS[args.quality]
     fps = args.fps if args.fps is not None else preset["fps"]
@@ -2667,6 +3211,16 @@ def main():
     youtube_client_secrets = Path(args.youtube_client_secrets)
     youtube_token_file = Path(args.youtube_token_file)
     youtube_tags = parse_youtube_tags(args.youtube_tags)
+
+    if args.settings_only or args.plan:
+        if shutil.which("ffmpeg") is None:
+            encoder = "unknown"
+        else:
+            encoder = "h264_videotoolbox" if ffmpeg_has_encoder("h264_videotoolbox") else "libx264"
+        settings = build_effective_settings(args, fps, resolution, bitrate, encoder)
+        planned_outputs = build_settings_only_plan(args, resolution)
+        print_settings_only_plan(settings, planned_outputs, getattr(args, "settings", "on"))
+        return
 
     if upload_only_path is not None:
         _run_upload_only(args, upload_only_path, youtube_client_secrets, youtube_token_file, youtube_tags)
@@ -2679,6 +3233,7 @@ def main():
     if not src.exists() or not src.is_dir():
         raise SystemExit(f"Missing source directory: {src}")
 
+    ensure_dir(outdir)
     preflight_media_tools()
 
     if args.youtube_upload and not args.dry_run:
@@ -2702,7 +3257,7 @@ def main():
             print_effective_settings(settings, getattr(args, "settings", "on"))
 
         images, infos, focal_points, n_clips, targets, part_groups, part_audio_offsets, base_cfg = _phase_prep(
-            args, src, temp_work, preset["blur_strength"], fps, resolution, bitrate, encoder, audio_path,
+            args, src, temp_work, outdir, preset["blur_strength"], fps, resolution, bitrate, encoder, audio_path,
         )
         outputs = _phase_render(
             args, src, images, infos, focal_points, n_clips, base_cfg, targets, outdir,

@@ -13,3 +13,4 @@ client_secrets.json
 input_photos/
 input_test/
 oauth.client.id
+.work_pngs/ 

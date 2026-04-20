@@ -273,16 +273,17 @@ When adding new features:
 
 ## Dependencies
 
-| Dependency | Required | Purpose |
+| Dependency | Default install | Purpose |
 |---|---|---|
 | ffmpeg + ffprobe | Yes | All video rendering and clip probing |
 | pillow | Yes | Image processing, EXIF extraction |
-| numpy | Yes | Motion calculations |
-| google-api-python-client | No | YouTube upload |
-| google-auth-oauthlib | No | YouTube OAuth |
-| mediapipe | No | Smart focus subject detection |
+| pillow-heif | Yes | HEIC/HEIF image input support |
+| numpy | Yes | MediaPipe image conversion and numeric helpers |
+| google-api-python-client | Yes | YouTube upload |
+| google-auth-oauthlib | Yes | YouTube OAuth |
+| mediapipe | Yes | Smart focus subject detection |
 
-Install for development with `pip install -r requirements.txt`; the project dependencies are declared in `pyproject.toml`.
+Install for development with `pip install -r requirements.txt`; the project dependencies are declared in `pyproject.toml`. `requirements-core.txt` is a lightweight source-checkout path for normal rendering without MediaPipe or Google API libraries.
 
 ---
 
@@ -292,6 +293,7 @@ Install for development with `pip install -r requirements.txt`; the project depe
 |---|---|
 | `memoramotion.py` | Entire implementation |
 | `pyproject.toml` | Package metadata and `memoramotion` console-script entry point |
+| `requirements-core.txt` | Lightweight source-checkout dependencies |
 | `tests/test_memoramotion.py` | Unit test suite |
 | `README.md` | User-facing docs and option table |
 | `client_secrets.json` | Google OAuth credentials (not committed) |

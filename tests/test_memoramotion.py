@@ -47,15 +47,26 @@ def _make_args(**overrides):
         sec=2.8,
         xfade=0.7,
         transition="fade",
+        transition_sequence=None,
+        transition_random=False,
+        transition_seed=None,
+        transition_only=None,
         seed=0,
         rhythm_strength=0.12,
         audio=None,
         audio_offset=0.0,
         audio_fade=None,
+        fit_to_audio=False,
+        audio_loop=False,
+        audio_trim_mode="hard",
         split_secs=None,
         fps=None,
         bitrate=None,
         dry_run=False,
+        settings_only=False,
+        plan=False,
+        storyboard=False,
+        media_report=False,
         clip_grade="full",
         clip_audio="mute",
         clip_max_sec=None,
@@ -69,6 +80,7 @@ def _make_args(**overrides):
         youtube_tags="",
         youtube_category="22",
         youtube_privacy="private",
+        settings="on",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -198,6 +210,53 @@ class MemoraMotionTests(unittest.TestCase):
             self.assertEqual(out, work / "000007_IMG_0001.png")
             self.assertTrue(out.exists())
 
+    def test_convert_single_image_registers_heif_support_for_heic(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            png_src = tmp_path / "IMG_0001.png"
+            src = tmp_path / "IMG_0001.heic"
+            work = tmp_path / "work"
+            work.mkdir(parents=True, exist_ok=True)
+
+            Image.new("RGB", (10, 10), color="white").save(png_src)
+            png_src.replace(src)
+
+            with patch("memoramotion.ensure_heif_support") as mock_heif:
+                _idx, out, _info, err = vps._convert_single_image((src, 7, work, False, False))
+
+            self.assertIsNone(err)
+            mock_heif.assert_called_once()
+            if out is None:
+                self.fail("Conversion unexpectedly returned no output path")
+            self.assertEqual(out, work / "000007_IMG_0001.png")
+            self.assertTrue(out.exists())
+
+    def test_ensure_heif_support_registers_pillow_heif_once(self):
+        fake_module = SimpleNamespace(register_heif_opener=MagicMock())
+        old_registered = vps._HEIF_OPENER_REGISTERED
+        try:
+            vps._HEIF_OPENER_REGISTERED = False
+            with patch("memoramotion.importlib.import_module", return_value=fake_module) as mock_import:
+                vps.ensure_heif_support()
+                vps.ensure_heif_support()
+        finally:
+            vps._HEIF_OPENER_REGISTERED = old_registered
+
+        mock_import.assert_called_once_with("pillow_heif")
+        fake_module.register_heif_opener.assert_called_once()
+
+    def test_ensure_heif_support_reports_missing_dependency(self):
+        old_registered = vps._HEIF_OPENER_REGISTERED
+        try:
+            vps._HEIF_OPENER_REGISTERED = False
+            with patch("memoramotion.importlib.import_module", side_effect=ModuleNotFoundError("pillow_heif")):
+                with self.assertRaises(SystemExit) as ctx:
+                    vps.ensure_heif_support()
+        finally:
+            vps._HEIF_OPENER_REGISTERED = old_registered
+
+        self.assertIn("HEIC/HEIF input requires pillow-heif", str(ctx.exception))
+
     # -----------------------------------------------------------------------
     # Output naming
     # -----------------------------------------------------------------------
@@ -264,11 +323,25 @@ class MemoraMotionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 vps.parse_args()
 
+    def test_validate_args_rejects_auto_in_transition_sequence(self):
+        args = _make_args(transition_sequence="fade,auto")
+
+        with self.assertRaises(SystemExit) as ctx:
+            vps._validate_args(args)
+
+        self.assertIn("cannot include auto", str(ctx.exception))
+
     def test_parse_args_accepts_ken_burns_engine(self):
         with patch("sys.argv", ["memoramotion", "./input_photos", "--ken-burns-engine", "fixed-viewport"]):
             args = vps.parse_args()
 
         self.assertEqual(args.ken_burns_engine, "fixed-viewport")
+
+    def test_parse_args_accepts_ken_burns_engine_auto(self):
+        with patch("sys.argv", ["memoramotion", "./input_photos", "--ken-burns-engine", "auto"]):
+            args = vps.parse_args()
+
+        self.assertEqual(args.ken_burns_engine, "auto")
 
     def test_parse_args_keeps_fixed_frame_alias_for_preserve_stage(self):
         with patch("sys.argv", ["memoramotion", "./input_photos", "--ken-burns-engine", "fixed-frame"]):
@@ -283,6 +356,13 @@ class MemoraMotionTests(unittest.TestCase):
 
         self.assertEqual(args.motion_style, "none")
         self.assertEqual(args.ken_burns_engine, "fit-overlay")
+
+    def test_validate_args_resolves_explicit_engine_auto(self):
+        args = _make_args(motion_style="kenburns", smart_focus=True, ken_burns_engine="auto")
+
+        vps._validate_args(args)
+
+        self.assertEqual(args.ken_burns_engine, "fixed-viewport")
 
     def test_validate_args_resolves_motion_auto_with_smart_focus_to_kenburns(self):
         args = _make_args(motion_style="auto", smart_focus=True, ken_burns_engine=None)
@@ -723,6 +803,27 @@ class MemoraMotionTests(unittest.TestCase):
 
         self.assertIn("force_original_aspect_ratio=decrease", filt)
         self.assertIn("[bg0][fg0]overlay=(W-w)/2:(H-h)/2", filt)
+
+    def test_build_xfade_chain_supports_transition_sequence(self):
+        chain = vps.build_xfade_chain(
+            [3.0, 3.0, 3.0],
+            0.5,
+            transition="auto",
+            transition_sequence=["fade", "smoothleft"],
+        )
+
+        self.assertIn("xfade=transition=fade", chain)
+        self.assertIn("xfade=transition=smoothleft", chain)
+
+    def test_build_xfade_chain_supports_transition_pool_for_auto(self):
+        chain = vps.build_xfade_chain(
+            [3.0, 3.0, 3.0],
+            0.5,
+            transition="auto",
+            transition_pool=["fade"],
+        )
+
+        self.assertEqual(chain.count("xfade=transition=fade"), 2)
 
     # -----------------------------------------------------------------------
     # Clip filter
@@ -1337,6 +1438,24 @@ class MemoraMotionTests(unittest.TestCase):
         )
         self.assertGreaterEqual(durations[0], 0.7 + 0.1)
 
+    def test_resolve_fit_to_audio_sec_adjusts_photo_duration(self):
+        infos = [self._info("a.png"), self._info("b.png"), self._info("c.png")]
+
+        fitted_sec = vps.resolve_fit_to_audio_sec(
+            infos,
+            base_sec=2.8,
+            xfade=0.5,
+            rhythm_strength=0.0,
+            seed=0,
+            clip_max_sec=None,
+            target_duration=12.0,
+        )
+
+        self.assertIsNotNone(fitted_sec)
+        assert fitted_sec is not None
+        durations = vps.build_media_durations(infos, fitted_sec, 0.5, 0.0, 0)
+        self.assertAlmostEqual(vps.estimate_duration_variable(durations, 0.5), 12.0, places=2)
+
     # -----------------------------------------------------------------------
     # audio fade — simple path
     # -----------------------------------------------------------------------
@@ -1349,6 +1468,32 @@ class MemoraMotionTests(unittest.TestCase):
             audio_fade=2.0,
         )
         cmd, _ = vps.build_render_command(images, Path("out.mp4"), 1920, 1080, cfg)
+        af_idx = cmd.index("-af")
+        self.assertIn("afade=t=out", cmd[af_idx + 1])
+        self.assertIn("d=2.000", cmd[af_idx + 1])
+
+    def test_audio_loop_adds_stream_loop_for_background_audio(self):
+        images = [Path("work/000000_a.png")]
+        cfg = vps.RenderConfig(
+            encoder="libx264",
+            audio_path=Path("music.mp3"),
+            audio_loop=True,
+        )
+        cmd, _ = vps.build_render_command(images, Path("out.mp4"), 1920, 1080, cfg)
+
+        loop_idx = cmd.index("-stream_loop")
+        self.assertEqual(cmd[loop_idx + 1], "-1")
+        self.assertLess(loop_idx, cmd.index("-i", loop_idx))
+
+    def test_audio_trim_mode_fade_defaults_to_two_seconds(self):
+        images = [Path("work/000000_a.png")]
+        cfg = vps.RenderConfig(
+            encoder="libx264",
+            audio_path=Path("music.mp3"),
+            audio_trim_mode="fade",
+        )
+        cmd, _ = vps.build_render_command(images, Path("out.mp4"), 1920, 1080, cfg)
+
         af_idx = cmd.index("-af")
         self.assertIn("afade=t=out", cmd[af_idx + 1])
         self.assertIn("d=2.000", cmd[af_idx + 1])
@@ -1397,6 +1542,72 @@ class MemoraMotionTests(unittest.TestCase):
         audio_map_idx = cmd.index("-map", cmd.index("-map") + 1)
         self.assertEqual(cmd[audio_map_idx + 1], "[aout]")
 
+    # -----------------------------------------------------------------------
+    # Manifests, planning, storyboard, and media reports
+    # -----------------------------------------------------------------------
+
+    def test_write_render_manifest_creates_sidecar_json(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_file = tmp_path / "a.png"
+            out = tmp_path / "render.mp4"
+            src_file.write_bytes(b"source")
+            out.write_bytes(b"video")
+            info = self._info(str(src_file))
+            info.path = src_file
+            cfg = vps.RenderConfig(encoder="libx264")
+
+            manifest_path = vps.write_render_manifest(
+                out=out,
+                src=tmp_path,
+                width=1920,
+                height=1080,
+                cfg=cfg,
+                actual_encoder="libx264",
+                images=[src_file],
+                infos=[info],
+                focal_points=[None],
+                render_command=["ffmpeg", "-i", "a.png", str(out)],
+                duration=2.8,
+            )
+
+            payload = json.loads(manifest_path.read_text())
+        self.assertEqual(payload["output"]["filename"], "render.mp4")
+        self.assertEqual(payload["output"]["encoder"], "libx264")
+        self.assertEqual(payload["counts"]["photos"], 1)
+        self.assertEqual(payload["media"][0]["source_path"], str(src_file))
+
+    def test_settings_only_main_prints_plan_without_source_dir(self):
+        args = _make_args(source_dir=None, settings_only=True, settings="json")
+        stream = StringIO()
+
+        with patch("memoramotion.parse_args", return_value=args), \
+             patch("memoramotion.ffmpeg_has_encoder", return_value=False), \
+             patch("memoramotion.collect_media") as mock_collect, \
+             redirect_stdout(stream):
+            vps.main()
+
+        payload = json.loads(stream.getvalue())
+        self.assertIn("planned_outputs", payload)
+        self.assertTrue(payload["settings"]["settings_only"])
+        mock_collect.assert_not_called()
+
+    def test_storyboard_contact_sheet_and_media_report_are_written(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            img = tmp_path / "a.png"
+            Image.new("RGB", (40, 30), color="red").save(img)
+            info = self._info(str(img))
+            info.path = img
+            storyboard = tmp_path / "storyboard.jpg"
+
+            vps.create_storyboard_contact_sheet([img], [info], [2.8], [], storyboard)
+            report = vps.build_media_validation_report(tmp_path, [img], [info], [2.8])
+
+            self.assertTrue(storyboard.exists())
+            self.assertEqual(report["counts"]["processed_items"], 1)
+            self.assertEqual(report["counts"]["photos"], 1)
+
     def test_preflight_media_tools_reports_missing_ffmpeg(self):
         with patch("memoramotion.shutil.which", return_value=None):
             with self.assertRaises(SystemExit) as ctx:
@@ -1411,9 +1622,18 @@ class MemoraMotionTests(unittest.TestCase):
 
         self.assertEqual(pyproject["project"]["name"], "memora-motion")
         self.assertEqual(pyproject["project"]["scripts"]["memoramotion"], "memoramotion:main")
-        dependencies = set(pyproject["project"]["dependencies"])
-        self.assertIn("mediapipe>=0.10", dependencies)
-        self.assertIn("google-api-python-client>=2.0", dependencies)
+        required = set(pyproject["project"]["dependencies"])
+        self.assertIn("Pillow>=10", required)
+        self.assertIn("pillow-heif>=0.18", required)
+        self.assertIn("mediapipe>=0.10", required)
+        self.assertIn("numpy>=1.20", required)
+        self.assertIn("google-api-python-client>=2.0", required)
+        self.assertIn("google-auth-httplib2>=0.2", required)
+        self.assertIn("google-auth-oauthlib>=1.0", required)
+        optional = pyproject["project"]["optional-dependencies"]
+        self.assertEqual(optional["smart-focus"], [])
+        self.assertEqual(optional["youtube"], [])
+        self.assertEqual(optional["all"], [])
 
     # -----------------------------------------------------------------------
     # dry-run skips YouTube preflight
