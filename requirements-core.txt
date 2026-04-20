@@ -1,0 +1,5 @@
+# Lightweight source-checkout install.
+# This supports normal photo/video rendering, including HEIC/HEIF via pillow-heif,
+# but does not install MediaPipe smart focus or YouTube upload dependencies.
+Pillow>=10
+pillow-heif>=0.18
